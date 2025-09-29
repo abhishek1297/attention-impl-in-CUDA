@@ -16,3 +16,7 @@ install/
 # python
 __pycache__
 *.pyc
+.ipynb_widgets
+
+# benchmarks
+*.csv
