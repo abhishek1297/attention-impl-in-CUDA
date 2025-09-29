@@ -1,6 +1,18 @@
+# installation
+build/
+install/
+
+# cuda
 *.i
 *.ii
 *.gpu
 *.ptx
 *.cubin
 *.fatbin
+
+# spack
+.spack-env
+
+# python
+__pycache__
+*.pyc
