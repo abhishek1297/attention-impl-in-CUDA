@@ -5,6 +5,7 @@ spack:
   - py-jupyter-server
   - py-pandas
   - py-matplotlib
+  - py-ipykernel
   view: true
   concretizer:
     unify: true

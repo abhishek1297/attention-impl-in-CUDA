@@ -1,74 +1,82 @@
-#include "attention.h"
+#include "allocator.hpp"
+#include "attention.hpp"
+#include "benchmark.hpp"
+#include "cuda_utils.hpp"
 
-#include <cuda_runtime.h>
-#include <cstdio>
-#include <cstdlib>
-#include <fstream>
-#include <vector>
-#include <cmath>
+#include <cassert>
+#include <functional>
 #include <iostream>
+#include <memory>
+#include <string>
+#include <tuple>
+#include <vector>
 
-// External factory
-extern "C" Attention* create_vanilla_attention();
+// External factories
+extern "C" Attention *create_vanilla_attention();
+extern "C" Attention *create_vanilla_cublas_attention();
 
-void initialize(float* data, int size) {
-    for (int i = 0; i < size; i++) data[i] = static_cast<float>(rand()) / RAND_MAX;
+// Helper to build all combinations
+template <typename... Vecs> auto cartesian_product(const Vecs &...vecs) {
+    std::vector<std::tuple<typename Vecs::value_type...>> result;
+    auto add = [&](auto self, auto tup, const auto &vec, const auto &...rest) -> void {
+        for (auto v : vec) {
+            auto new_tup = std::tuple_cat(tup, std::make_tuple(v));
+            if constexpr (sizeof...(rest) == 0)
+                result.push_back(new_tup);
+            else
+                self(self, new_tup, rest...);
+        }
+    };
+    add(add, std::tuple<>{}, vecs...);
+    return result;
 }
 
 int main() {
+    MatrixManager mm;
     // Benchmark parameters
-    std::vector<int> seq_lengths = {64, 128, 256, 512, 1024, 2048};
-    std::vector<int> embed_dims  = {32, 64, 128, 256, 512};
-    int batch = 1;
+    std::vector<int> seq_lengths = {128, 512, 1024, 2048, 4096};
+    std::vector<int> embed_dims = {128, 4096, 8192};
+    std::vector<int> num_attn_heads = {1, 2, 8, 16};
+    std::vector<int> batch_sizes = {1};
 
-    // Open CSV file
-    std::ofstream out_file("benchmarks/vanilla_benchmark.csv");
-    out_file << "seq_len,embed_dim,time_ms\n";
+    write_gpu_info();
+    // Define (filename, factory function) pairs
+    std::vector<std::unique_ptr<Benchmark>> benchmarks;
+    benchmarks.push_back(
+        std::make_unique<Benchmark>(get_benchmark_filename("vanilla"), create_vanilla_attention));
+    benchmarks.push_back(std::make_unique<Benchmark>(get_benchmark_filename("vanilla_cublas"),
+                                                     create_vanilla_cublas_attention));
 
-    // Create vanilla attention
-    Attention* attn = create_vanilla_attention();
+    for (auto [batch_size, num_heads, seq_len, embed_dim] :
+         cartesian_product(batch_sizes, num_attn_heads, seq_lengths, embed_dims)) {
 
-    for (int seq_len : seq_lengths) {
-        for (int dim : embed_dims) {
-            size_t qkv_size = seq_len * dim * sizeof(float);
-
-            // Allocate unified memory for Q, K, V, out
-            float *Q, *K, *V, *out;
-            cudaMallocManaged(&Q, qkv_size);
-            cudaMallocManaged(&K, qkv_size);
-            cudaMallocManaged(&V, qkv_size);
-            cudaMallocManaged(&out, qkv_size);
-
-            // Initialize dummy data
-            initialize(Q, seq_len * dim);
-            initialize(K, seq_len * dim);
-            initialize(V, seq_len * dim);
-
-            // Timing with CUDA events
-            cudaEvent_t start, stop;
-            cudaEventCreate(&start);
-            cudaEventCreate(&stop);
-
-            cudaEventRecord(start);
-            attn->forward(Q, K, V, out, batch, seq_len, dim);
-            cudaEventRecord(stop);
-            cudaEventSynchronize(stop);
-
-            float ms = 0;
-            cudaEventElapsedTime(&ms, start, stop);
-
-            // Write to CSV
-            out_file << seq_len << "," << dim << "," << ms << "\n";
-            std::cout << "seq_len=" << seq_len << " dim=" << dim << " time=" << ms << " ms\n";
-
-            // Free memory
-            cudaFree(Q); cudaFree(K); cudaFree(V); cudaFree(out);
-            cudaEventDestroy(start);
-            cudaEventDestroy(stop);
+        assert(embed_dim % num_heads == 0);
+        int head_dim = (int) embed_dim / num_heads;
+        size_t qkv_elements = batch_size * num_heads * seq_len * head_dim;
+        // Check if allocation is possible
+        if (!mm.can_allocate(qkv_elements * 4 * sizeof(float))) {
+            std::cerr << "Skipping: Not enough memory for batch_size=" << batch_size
+                      << ", num_heads=" << num_heads << ", seq_len=" << seq_len
+                      << ", embed_dim=" << embed_dim << std::endl;
+            continue;
         }
+        float *Q = mm.allocate_and_fill(qkv_elements);
+        float *K = mm.allocate_and_fill(qkv_elements);
+        float *V = mm.allocate_and_fill(qkv_elements);
+        float *O = mm.allocate_and_fill(qkv_elements, true);
+        // save_device_ptr_as_buffer("Q.bin", Q, qkv_elements);
+        // save_device_ptr_as_buffer("K.bin", K, qkv_elements);
+        // save_device_ptr_as_buffer("V.bin", V, qkv_elements);
+
+        for (auto &bmark : benchmarks)
+            bmark->run(Q, K, V, O, batch_size, num_heads, seq_len, head_dim);
+
+        // save_device_ptr_as_buffer("O.bin", O, qkv_elements);
+        mm.free_all();
+        std::cout << "Benchmark for batch_size=" << batch_size << ", num_heads=" << num_heads
+                  << ", seq_len=" << seq_len << ", embed_dim=" << embed_dim << " finished."
+                  << std::endl;
     }
 
-    out_file.close();
-    delete attn;
     return 0;
 }
