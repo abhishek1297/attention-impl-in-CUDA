@@ -55,34 +55,49 @@ inline void write_gpu_info() {
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, device_id);
 
-    // Core characteristics
     std::string name(prop.name);
     int sm_count = prop.multiProcessorCount;
-    double clock_rate_hz = static_cast<double>(prop.clockRate) * 1e3; // in Hz
+    double clock_rate_hz = static_cast<double>(prop.clockRate) * 1e3;
 
-    // FLOPs per SM per clock (FP32)
-    // Usually 128 FMA units per SM → 256 FLOPs per cycle
+    // FP32 throughput estimate: 128 FMA units per SM => 256 FLOPs/clock per SM
     const int fma_per_cycle_per_sm = 128;
     double theoretical_flops =
         static_cast<double>(sm_count) * fma_per_cycle_per_sm * 2.0 * clock_rate_hz;
     double theoretical_gflops = theoretical_flops / 1e9;
 
-    // Memory bandwidth (optional, useful for roofline)
+    // Memory bandwidth (approximate)
     double mem_bandwidth_gb = 2.0 * prop.memoryClockRate * 1000.0 * (prop.memoryBusWidth / 8) / 1e9;
 
-    // Compute filename
+    // Additional architectural info
+    int warp_size = prop.warpSize;
+    size_t shared_mem_per_block = prop.sharedMemPerBlock;
+    int max_threads_per_block = prop.maxThreadsPerBlock;
+    int regs_per_block = prop.regsPerBlock;
+    int major_cc = prop.major;
+    int minor_cc = prop.minor;
+
+    // Write to CSV
     std::ofstream out("benchmarks/device_info.csv");
-    out << "name,sm_count,clock_rate_hz,theoretical_gflops,memory_bandwidth_gb\n";
+    out << "name,sm_count,clock_rate_hz,theoretical_gflops,memory_bandwidth_gb,"
+        << "warp_size,shared_mem_per_block,max_threads_per_block,regs_per_block,cc\n";
     out << "\"" << name << "\"," << sm_count << "," << clock_rate_hz << "," << theoretical_gflops
-        << "," << mem_bandwidth_gb << "\n";
+        << "," << mem_bandwidth_gb << "," << warp_size << "," << shared_mem_per_block << ","
+        << max_threads_per_block << "," << regs_per_block << "," << major_cc << "." << minor_cc
+        << "\n";
     out.close();
 
+    // Console summary
     std::cout << "=================================================================\n";
     std::cout << "Device info written to device_info.csv\n";
     std::cout << "Name: " << name << "\n";
+    std::cout << "Compute Capability: " << major_cc << "." << minor_cc << "\n";
     std::cout << "SM count: " << sm_count << "\n";
     std::cout << "Clock: " << clock_rate_hz / 1e9 << " GHz\n";
     std::cout << "Theoretical FP32 peak: " << theoretical_gflops << " GFLOPs\n";
     std::cout << "Memory Bandwidth: " << mem_bandwidth_gb << " GB/s\n";
+    std::cout << "Warp Size: " << warp_size << "\n";
+    std::cout << "Shared Mem / Block: " << shared_mem_per_block / 1024.0 << " KB\n";
+    std::cout << "Max Threads / Block: " << max_threads_per_block << "\n";
+    std::cout << "Registers / Block: " << regs_per_block << "\n";
     std::cout << "=================================================================\n";
 }
