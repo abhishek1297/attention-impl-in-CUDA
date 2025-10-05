@@ -14,10 +14,10 @@
 
 // Kernel: strided and batched QK^T with partial max reductions only
 __global__ void qk_dot_partial_reduce(float *Q, float *K, float *attn_scores,
-                                      float *row_max_partials, int seq_len, int head_dim,
-                                      int blocks_x) {
+                                      float *row_max_partials, int seq_len, int head_dim) {
 
     int bh_idx = blockIdx.z;
+    int blocks_x = gridDim.x;
     int block_row = blockIdx.y * TILE_DIM;
     int block_col = blockIdx.x * TILE_DIM;
 
@@ -75,21 +75,21 @@ __global__ void qk_dot_partial_reduce(float *Q, float *K, float *attn_scores,
     }
 
     // Compute partial max (only max, no exp yet)
-    __shared__ float row_max[TILE_DIM][TILE_DIM];
+    __shared__ float scores_tile[TILE_DIM][TILE_DIM];
 
     if (row < seq_len && col < seq_len) {
-        row_max[local_row][local_col] = acc;
+        scores_tile[local_row][local_col] = acc;
     } else {
-        row_max[local_row][local_col] = -CUDART_INF_F;
+        scores_tile[local_row][local_col] = -CUDART_INF_F;
     }
     __syncthreads();
 
     // Parallel reduction (max) across the tile columns
     for (int offset = TILE_DIM >> 1; offset > 0; offset >>= 1) {
         if (local_col < offset) {
-            float a = row_max[local_row][local_col];
-            float b = row_max[local_row][local_col + offset];
-            row_max[local_row][local_col] = (a > b) ? a : b;
+            float a = scores_tile[local_row][local_col];
+            float b = scores_tile[local_row][local_col + offset];
+            scores_tile[local_row][local_col] = (a > b) ? a : b;
         }
         __syncthreads();
     }
@@ -97,48 +97,68 @@ __global__ void qk_dot_partial_reduce(float *Q, float *K, float *attn_scores,
     // Write partial max to global memory
     if (local_col == 0 && row < seq_len) {
         int idx = ROW_OFFSET(bh_idx, row, seq_len, blocks_x) + blockIdx.x;
-        row_max_partials[idx] = row_max[local_row][0];
+        row_max_partials[idx] = scores_tile[local_row][0];
     }
 }
 
 // Kernel: find global max and compute global sum
-__global__ void reduce_and_sum(const float *attention_scores, const float *row_max_partials,
-                               float *row_max_finals, float *row_sum_finals, int seq_len,
-                               int blocks_x) {
+__global__ void softmax_inplace(float *attention_scores, const float *row_max_partials, int seq_len,
+                                int partials_blocks_x) {
 
     int bh_idx = blockIdx.z;
     int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int tid = threadIdx.x;
 
     if (row >= seq_len)
         return;
 
-    const float *row_max_bh_base = PARTIALS_PTR(row_max_partials, bh_idx, row, seq_len, blocks_x);
+    const float *row_max_bh_base = PARTIALS_PTR(row_max_partials, bh_idx, row, seq_len, partials_blocks_x);
 
-    // Find global max across all tile blocks by row
-    float global_max = -CUDART_INF_F;
-    for (int bx = 0; bx < blocks_x; ++bx) {
-        float tile_max = row_max_bh_base[bx];
-        if (tile_max > global_max) {
-            global_max = tile_max;
+    // Find max (for numerical stability)
+    float row_max;
+    __shared__ float shared_row_max;
+    if (tid == 0) {
+        row_max = -CUDART_INF_F;
+        for (int bx = 0; bx < partials_blocks_x; bx++) {
+            float block_max = row_max_bh_base[bx];
+            if (block_max > row_max)
+                row_max = block_max;
         }
+        shared_row_max = row_max;
+    }
+    // synchronize row max from thread 0 to all
+    __syncthreads();
+    row_max = shared_row_max;
+
+    // Compute sum of exp(score - row_max) across all columns
+    float *attn_bh_base = ATTN_PTR(attention_scores, bh_idx, seq_len);
+    float row_sum = 0.0f;
+
+    for (int col = tid; col < seq_len; col += blockDim.x) {
+        int idx = row * seq_len + col;
+        float score = expf(attn_bh_base[idx] - row_max);
+        row_sum += score;
+        attn_bh_base[idx] = score;
     }
 
-    // Compute sum of exp(score - global_max) across all columns
-    const float *attn_bh_base = ATTN_PTR(attention_scores, bh_idx, seq_len);
-    float global_sum = 0.0f;
-    for (int col = 0; col < seq_len; ++col) {
-        float score = attn_bh_base[row * seq_len + col];
-        global_sum += expf(score - global_max);
+    extern __shared__ float shared_sum[];
+    shared_sum[tid] = row_sum;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset)
+            shared_sum[tid] += shared_sum[tid + offset];
+        __syncthreads();
     }
 
-    row_max_finals[BH_ROW_IDX(bh_idx, row, seq_len)] = global_max;
-    row_sum_finals[BH_ROW_IDX(bh_idx, row, seq_len)] = (float) global_sum;
+    // normalize attention scores
+    const float norm =  1 / shared_sum[0];
+    for (int col = tid; col < seq_len; col += blockDim.x) {
+        attn_bh_base[row * seq_len + col] *= norm;
+    }
 }
 
 // Kernel: apply softmax and multiply by V
-// Each row of output is computed by one block
-__global__ void softmax_multV(const float *attention_scores, const float *V,
-                              const float *row_max_finals, const float *row_sum_finals, float *O,
+__global__ void softmax_multV(const float *attention_scores, const float *V, float *O,
                               int seq_len, int head_dim) {
 
     int bh_idx = blockIdx.z;
@@ -158,31 +178,19 @@ __global__ void softmax_multV(const float *attention_scores, const float *V,
     const float *Vbh_base = V_PTR(V, bh_idx, seq_len, head_dim);
     float *Obh_base = O_PTR(O, bh_idx, seq_len, head_dim);
 
-    __shared__ float row_max[TILE_DIM];
-    __shared__ float row_norm[TILE_DIM];
     __shared__ float softmax_tile[TILE_DIM][TILE_DIM];
     __shared__ float V_tile[TILE_DIM][TILE_DIM];
 
-    // Load max and norm for each row in this block
-    if (local_col == 0) {
-        row_max[local_row] = row_max_finals[BH_ROW_IDX(bh_idx, row, seq_len)];
-        row_norm[local_row] = 1.0f / row_sum_finals[BH_ROW_IDX(bh_idx, row, seq_len)];
-    }
-    __syncthreads();
-
     float acc = 0.0f;
 
-    // Tile across seq_len (the k dimension in softmax[i,k] * V[k,j])
     int num_tiles = (seq_len + TILE_DIM - 1) / TILE_DIM;
 
     for (int t = 0; t < num_tiles; ++t) {
-        int k = t * TILE_DIM + local_col; // Shared dimension index
+        int k = t * TILE_DIM + local_col;
 
         // Load softmax tile: softmax[row, k]
         if (row < seq_len && k < seq_len) {
-            float score = attn_bh_base[row * seq_len + k];
-            softmax_tile[local_row][local_col] =
-                expf(score - row_max[local_row]) * row_norm[local_row];
+            softmax_tile[local_row][local_col] = attn_bh_base[row * seq_len + k];
         } else {
             softmax_tile[local_row][local_col] = 0.0f;
         }
@@ -195,7 +203,6 @@ __global__ void softmax_multV(const float *attention_scores, const float *V,
         }
         __syncthreads();
 
-// Compute partial product
 #pragma unroll
         for (int k = 0; k < TILE_DIM; ++k) {
             acc += softmax_tile[local_row][k] * V_tile[k][local_col];
@@ -216,7 +223,6 @@ struct VanillaAttention : public Attention {
 
         float *attention_scores;
         float *row_max_partials;
-        float *row_max_finals, *row_sum_finals;
 
         const size_t n_qkt = batch_size * num_heads * seq_len * seq_len;
         cudaMalloc(&attention_scores, n_qkt * sizeof(float));
@@ -227,34 +233,27 @@ struct VanillaAttention : public Attention {
         const size_t n_partials = batch_size * num_heads * seq_len * blocks_x;
         cudaMalloc(&row_max_partials, n_partials * sizeof(float));
 
-        const size_t n_finals = batch_size * num_heads * seq_len;
-        cudaMalloc(&row_max_finals, n_finals * sizeof(float));
-        cudaMalloc(&row_sum_finals, n_finals * sizeof(float));
-
         // Kernel 1: Compute QK^T and partial max values
         dim3 threads(TILE_DIM, TILE_DIM);
         dim3 grid(blocks_x, blocks_y, batch_size * num_heads);
-        qk_dot_partial_reduce<<<grid, threads>>>(Q, K, attention_scores, row_max_partials, seq_len,
-                                                 head_dim, blocks_x);
+        qk_dot_partial_reduce<<<grid, threads>>>(Q, K, attention_scores, row_max_partials, seq_len, head_dim);
         cudaDeviceSynchronize();
 
         // save_device_ptr_as_buffer("QKt.bin", attention_scores, n_qkt);
-        // Kernel 2: Reduce to global max and compute sum
-        dim3 threads2(1, 1, 1);
+        // Kernel 2:  Apply per row max and normalize with per row sum
+        int per_row_threads = max(TILE_DIM * blocks_x, 1024);
+        dim3 threads2(per_row_threads, 1, 1);
         dim3 grid2(1, seq_len, batch_size * num_heads);
-        reduce_and_sum<<<grid2, threads2>>>(attention_scores, row_max_partials, row_max_finals,
-                                            row_sum_finals, seq_len, blocks_x);
+        int shared_bytes = per_row_threads * sizeof(float);
+        softmax_inplace<<<grid2, threads2, shared_bytes>>>(attention_scores, row_max_partials, seq_len, blocks_x);
         cudaDeviceSynchronize();
 
         // Kernel 3: Apply softmax and multiply by V
-        softmax_multV<<<grid, threads>>>(attention_scores, V, row_max_finals, row_sum_finals, O,
-                                         seq_len, head_dim);
+        softmax_multV<<<grid, threads>>>(attention_scores, V, O, seq_len, head_dim);
         cudaDeviceSynchronize();
 
         cudaFree(attention_scores);
         cudaFree(row_max_partials);
-        cudaFree(row_max_finals);
-        cudaFree(row_sum_finals);
     }
 };
 

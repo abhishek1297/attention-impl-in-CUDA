@@ -76,6 +76,7 @@ struct CublasAttention : public Attention {
         if (status != CUBLAS_STATUS_SUCCESS) {
             throw std::runtime_error("cuBLAS initialization failed");
         }
+        cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
     }
 
     ~CublasAttention() { cublasDestroy(handle); }
