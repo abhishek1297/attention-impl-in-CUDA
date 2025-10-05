@@ -13,6 +13,7 @@ install/
 *.bin
 *.cubin
 *.fatbin
+*.nsys-rep
 
 # spack
 .spack-env

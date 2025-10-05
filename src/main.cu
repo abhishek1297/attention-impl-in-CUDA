@@ -90,14 +90,14 @@ int main() {
         float *K = mm.allocate_and_fill(qkv_elements);
         float *V = mm.allocate_and_fill(qkv_elements);
         float *O = mm.allocate_and_fill(qkv_elements, true);
-        save_device_ptr_as_buffer("Q.bin", Q, qkv_elements);
-        save_device_ptr_as_buffer("K.bin", K, qkv_elements);
-        save_device_ptr_as_buffer("V.bin", V, qkv_elements);
+        // save_device_ptr_as_buffer("Q.bin", Q, qkv_elements);
+        // save_device_ptr_as_buffer("K.bin", K, qkv_elements);
+        // save_device_ptr_as_buffer("V.bin", V, qkv_elements);
 
         for (auto &bmark : benchmarks)
             bmark->run(Q, K, V, O, batch_size, num_heads, seq_len, head_dim);
 
-        save_device_ptr_as_buffer("O.bin", O, qkv_elements);
+        // save_device_ptr_as_buffer("O.bin", O, qkv_elements);
         mm.free_all();
         std::cout << "Benchmark for batch_size=" << batch_size << ", num_heads=" << num_heads
                   << ", seq_len=" << seq_len << ", embed_dim=" << embed_dim << " finished."
