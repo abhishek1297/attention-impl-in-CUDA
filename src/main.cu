@@ -7,10 +7,10 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <string>
 #include <tuple>
 #include <vector>
-#include <set>
 #include <yaml-cpp/yaml.h>
 
 // External factories
@@ -23,13 +23,17 @@ struct BenchmarkEntry {
 };
 
 // Helper to run return selected benchmarks
-std::vector<std::unique_ptr<Benchmark>> get_selected_benchmarks(const std::set<std::string>& keys) {
+std::vector<std::unique_ptr<Benchmark>> get_selected_benchmarks(const std::set<std::string> &keys) {
     std::vector<BenchmarkEntry> all_benchmarks;
-    all_benchmarks.push_back({"vanilla", std::make_unique<Benchmark>(get_benchmark_filename("vanilla"), create_vanilla_attention)});
-    all_benchmarks.push_back({"vanilla_cublas", std::make_unique<Benchmark>(get_benchmark_filename("vanilla_cublas"), create_vanilla_cublas_attention)});
+    all_benchmarks.push_back(
+        {"vanilla",
+         std::make_unique<Benchmark>(get_benchmark_filename("vanilla"), create_vanilla_attention)});
+    all_benchmarks.push_back(
+        {"vanilla_cublas", std::make_unique<Benchmark>(get_benchmark_filename("vanilla_cublas"),
+                                                       create_vanilla_cublas_attention)});
 
     std::vector<std::unique_ptr<Benchmark>> selected;
-    for (auto& entry : all_benchmarks) {
+    for (auto &entry : all_benchmarks) {
         if (keys.count(entry.key)) {
             selected.push_back(std::move(entry.instance));
         }
@@ -64,7 +68,7 @@ int main() {
 
     write_gpu_info();
     std::set<std::string> to_run;
-    for (const auto& name : config["benchmarks_to_run"]) {
+    for (const auto &name : config["benchmarks_to_run"]) {
         to_run.insert(name.as<std::string>());
     }
     auto benchmarks = get_selected_benchmarks(to_run);

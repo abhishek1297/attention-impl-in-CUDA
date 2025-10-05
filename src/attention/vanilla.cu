@@ -112,7 +112,8 @@ __global__ void softmax_inplace(float *attention_scores, const float *row_max_pa
     if (row >= seq_len)
         return;
 
-    const float *row_max_bh_base = PARTIALS_PTR(row_max_partials, bh_idx, row, seq_len, partials_blocks_x);
+    const float *row_max_bh_base =
+        PARTIALS_PTR(row_max_partials, bh_idx, row, seq_len, partials_blocks_x);
 
     // Find max (for numerical stability)
     float row_max;
@@ -151,15 +152,15 @@ __global__ void softmax_inplace(float *attention_scores, const float *row_max_pa
     }
 
     // normalize attention scores
-    const float norm =  1 / shared_sum[0];
+    const float norm = 1 / shared_sum[0];
     for (int col = tid; col < seq_len; col += blockDim.x) {
         attn_bh_base[row * seq_len + col] *= norm;
     }
 }
 
 // Kernel: apply softmax and multiply by V
-__global__ void softmax_multV(const float *attention_scores, const float *V, float *O,
-                              int seq_len, int head_dim) {
+__global__ void softmax_multV(const float *attention_scores, const float *V, float *O, int seq_len,
+                              int head_dim) {
 
     int bh_idx = blockIdx.z;
     int block_row = blockIdx.y * TILE_DIM;
@@ -236,7 +237,8 @@ struct VanillaAttention : public Attention {
         // Kernel 1: Compute QK^T and partial max values
         dim3 threads(TILE_DIM, TILE_DIM);
         dim3 grid(blocks_x, blocks_y, batch_size * num_heads);
-        qk_dot_partial_reduce<<<grid, threads>>>(Q, K, attention_scores, row_max_partials, seq_len, head_dim);
+        qk_dot_partial_reduce<<<grid, threads>>>(Q, K, attention_scores, row_max_partials, seq_len,
+                                                 head_dim);
         cudaDeviceSynchronize();
 
         // save_device_ptr_as_buffer("QKt.bin", attention_scores, n_qkt);
@@ -245,7 +247,8 @@ struct VanillaAttention : public Attention {
         dim3 threads2(per_row_threads, 1, 1);
         dim3 grid2(1, seq_len, batch_size * num_heads);
         int shared_bytes = per_row_threads * sizeof(float);
-        softmax_inplace<<<grid2, threads2, shared_bytes>>>(attention_scores, row_max_partials, seq_len, blocks_x);
+        softmax_inplace<<<grid2, threads2, shared_bytes>>>(attention_scores, row_max_partials,
+                                                           seq_len, blocks_x);
         cudaDeviceSynchronize();
 
         // Kernel 3: Apply softmax and multiply by V
