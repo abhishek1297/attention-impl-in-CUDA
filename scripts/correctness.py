@@ -1,6 +1,7 @@
 # type: ignore
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 import argparse
 import os
@@ -53,18 +54,10 @@ if __name__ == "__main__":
     Vbh = load_and_assert(args.v_bin, (batch_heads, seq_len, head_dim))
     kernel_out = load_and_assert(args.o_bin, (batch_heads, seq_len, head_dim))
 
-    # Reference attention: compute per head
-    outputs = torch.empty(
-        (batch_heads, seq_len, head_dim), device=device, dtype=torch.float32
-    )
-    for bh in range(batch_heads):
-        q = Qbh[bh]
-        k = Kbh[bh]
-        v = Vbh[bh]
-        scores = torch.matmul(q, k.transpose(0, 1)) / (head_dim**0.5)
-        probs = torch.softmax(scores, dim=1)
-        out = torch.matmul(probs, v)
-        outputs[bh].copy_(out)
+    scale = 1 / head_dim**0.5
+    Sbh = torch.bmm(Qbh, Kbh.transpose(1, 2)) * scale
+    probs = F.softmax(Sbh, dim=2)
+    outputs = torch.bmm(probs, Vbh)
 
     # Compare
     diff = (kernel_out - outputs).abs()
