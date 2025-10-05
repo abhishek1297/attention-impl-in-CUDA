@@ -6,6 +6,7 @@ spack:
   - py-pandas
   - py-matplotlib
   - py-ipykernel
+  - yaml-cpp
   view: true
   concretizer:
     unify: true

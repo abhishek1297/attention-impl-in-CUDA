@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(attention_implementations_with_CUDA LANGUAGES CXX CUDA)
 find_package(CUDAToolkit REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
@@ -27,5 +28,5 @@ target_link_libraries(attention PRIVATE CUDA::cublas CUDA::cudart)
 
 add_executable(run_entrypoint src/main.cu)
 set_target_properties(run_entrypoint PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-target_link_libraries(run_entrypoint PRIVATE attention benchmark_utils)
+target_link_libraries(run_entrypoint PRIVATE attention benchmark_utils yaml-cpp::yaml-cpp)
 add_definitions(-Wno-deprecated-gpu-targets)
