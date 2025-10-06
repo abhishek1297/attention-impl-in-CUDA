@@ -14,9 +14,9 @@
 #define TILE_DIM 32
 
 // Kernel: strided and batched QK^T with partial max reductions only
-__global__ void qk_dot_partial_reduce_v2(const float *Q, const float *K, float *attn_scores,
-                                         float *row_max_partials, int seq_len, int head_dim,
-                                         const float scale) {
+__global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q, const float *__restrict__ K,
+                                         float *attn_scores, float *row_max_partials, int seq_len,
+                                         int head_dim, const float scale) {
 
     int bh_idx = blockIdx.z;
     int blocks_x = gridDim.x;
@@ -123,8 +123,9 @@ __global__ void qk_dot_partial_reduce_v2(const float *Q, const float *K, float *
 }
 
 // Kernel: find global max and compute global sum
-__global__ void softmax_inplace_v2(float *attention_scores, const float *row_max_partials,
-                                   int seq_len, int partials_blocks_x) {
+__global__ void softmax_inplace_v2(float *attention_scores,
+                                   const float *__restrict__ row_max_partials, int seq_len,
+                                   int partials_blocks_x) {
 
     int bh_idx = blockIdx.z;
     int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -180,8 +181,8 @@ __global__ void softmax_inplace_v2(float *attention_scores, const float *row_max
 }
 
 // Kernel: apply softmax and multiply by V
-__global__ void softmax_multV_v2(const float *attention_scores, const float *V, float *O,
-                                 int seq_len, int head_dim) {
+__global__ void softmax_multV_v2(const float *__restrict__ attention_scores,
+                                 const float *__restrict__ V, float *O, int seq_len, int head_dim) {
 
     int bh_idx = blockIdx.z;
     int block_row = blockIdx.y * TILE_DIM;
