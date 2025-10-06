@@ -22,11 +22,11 @@ class Benchmark {
     void stop();
 
     float get_avg_elapsed_time() const;
-    double get_gflops(int batch_size, int num_heads, int seq_len, int head_dim,
+    double get_gflops(uint32_t batch_size, uint32_t num_heads, uint32_t seq_len, uint32_t head_dim,
                       float avg_time_ms) const;
 
-    void run(int total_runs, float *Q, float *K, float *V, float *O, int batch_size, int num_heads,
-             int seq_len, int head_dim);
+    void run(uint32_t total_runs, const float *Q, const float *K, const float *V, float *O,
+             uint32_t batch_size, uint32_t num_heads, uint32_t seq_len, uint32_t head_dim);
 
   private:
     cudaEvent_t start_event = nullptr;

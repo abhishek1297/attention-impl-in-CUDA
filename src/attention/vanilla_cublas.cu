@@ -81,13 +81,13 @@ struct CublasAttention : public Attention {
 
     ~CublasAttention() { cublasDestroy(handle); }
 
-    void forward(float *Q, float *K, float *V, float *O, int batch_size, int num_heads, int seq_len,
-                 int head_dim) override {
+    void forward(const float *Q, const float *K, const float *V, float *O, uint batch_size,
+                 uint num_heads, uint seq_len, uint head_dim) override {
 
-        int batch_heads = batch_size * num_heads;
+        uint batch_heads = batch_size * num_heads;
         float *attention_scores;
 
-        int n_scores = batch_heads * seq_len * seq_len;
+        uint n_scores = batch_heads * seq_len * seq_len;
         cudaMalloc(&attention_scores, n_scores * sizeof(float));
 
         // Scale factor for attention

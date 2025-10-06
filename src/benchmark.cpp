@@ -38,8 +38,8 @@ float Benchmark::get_avg_elapsed_time() const {
     return std::accumulate(times.begin(), times.end(), 0.0f) / times.size();
 }
 
-double Benchmark::get_gflops(int batch_size, int num_heads, int seq_len, int head_dim,
-                             float avg_time_ms) const {
+double Benchmark::get_gflops(uint32_t batch_size, uint32_t num_heads, uint32_t seq_len,
+                             uint32_t head_dim, float avg_time_ms) const {
     double flops = batch_size * num_heads *
                    (2.0 * seq_len * seq_len * head_dim + // QK^T
                     seq_len * seq_len +                  // softmax
@@ -48,8 +48,9 @@ double Benchmark::get_gflops(int batch_size, int num_heads, int seq_len, int hea
     return (flops / (avg_time_ms / 1000.0)) / 1e9;
 }
 
-void Benchmark::run(int total_runs, float *Q, float *K, float *V, float *O, int batch_size,
-                    int num_heads, int seq_len, int head_dim) {
+void Benchmark::run(const uint32_t total_runs, const float *Q, const float *K, const float *V,
+                    float *O, uint32_t batch_size, uint32_t num_heads, uint32_t seq_len,
+                    uint32_t head_dim) {
 
     Attention *attn = factory();
 

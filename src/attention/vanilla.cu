@@ -13,7 +13,7 @@
 #define TILE_DIM 32
 
 // Kernel: strided and batched QK^T with partial max reductions only
-__global__ void qk_dot_partial_reduce(float *Q, float *K, float *attn_scores,
+__global__ void qk_dot_partial_reduce(const float *Q, const float *K, float *attn_scores,
                                       float *row_max_partials, int seq_len, int head_dim) {
 
     int bh_idx = blockIdx.z;
@@ -219,8 +219,8 @@ __global__ void softmax_multV(const float *attention_scores, const float *V, flo
 // Simple attention implementation
 struct VanillaAttention : public Attention {
 
-    void forward(float *Q, float *K, float *V, float *O, int batch_size, int num_heads, int seq_len,
-                 int head_dim) override {
+    void forward(const float *Q, const float *K, const float *V, float *O, uint32_t batch_size,
+                 uint32_t num_heads, uint32_t seq_len, uint32_t head_dim) override {
 
         float *attention_scores;
         float *row_max_partials;

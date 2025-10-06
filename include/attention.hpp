@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <cuda_runtime.h>
 
 #define BH_ROW_IDX(bh_idx, row, seq_len) ((size_t) (bh_idx) * (seq_len) + (row))
@@ -14,7 +15,8 @@
 
 // Abstract interface for different attention implementations
 struct Attention {
-    virtual void forward(float *Q, float *K, float *V, float *O, int batch_size, int num_heads,
-                         int seq_len, int head_dim) = 0;
+    virtual void forward(const float *Q, const float *K, const float *V, float *O,
+                         uint32_t batch_size, uint32_t num_heads, uint32_t seq_len,
+                         uint32_t head_dim) = 0;
     virtual ~Attention() {}
 };
