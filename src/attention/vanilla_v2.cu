@@ -13,8 +13,9 @@
 #define TILE_DIM 32
 
 // Kernel: strided and batched QK^T with partial max reductions only
-__global__ void qk_dot_partial_reduce(float *Q, float *K, float *attn_scores,
-                                      float *row_max_partials, int seq_len, int head_dim) {
+__global__ void qk_dot_partial_reduce_v2(float *Q, float *K, float *attn_scores,
+                                         float *row_max_partials, int seq_len, int head_dim,
+                                         const float scale) {
 
     int bh_idx = blockIdx.z;
     int blocks_x = gridDim.x;
@@ -35,7 +36,6 @@ __global__ void qk_dot_partial_reduce(float *Q, float *K, float *attn_scores,
     __shared__ float Kt_tile[TILE_DIM][TILE_DIM + 1]; // avoid bank conflicts by padding
 
     float acc = 0.0f;
-    const float scale = 1.0f / sqrtf((float) head_dim);
 
     int num_tiles = (head_dim + TILE_DIM - 1) / TILE_DIM;
 
@@ -43,18 +43,13 @@ __global__ void qk_dot_partial_reduce(float *Q, float *K, float *attn_scores,
         int q_col = t * TILE_DIM + local_col;
         int k_row = t * TILE_DIM + local_row;
 
-        if (row < seq_len && q_col < head_dim) {
-            Q_tile[local_row][local_col] = Qbh_base[row * head_dim + q_col];
-        } else {
-            Q_tile[local_row][local_col] = 0.0f;
-        }
+        float q_val = (row < seq_len && q_col < head_dim) ? Qbh_base[row * head_dim + q_col] : 0.0f;
+        Q_tile[local_row][local_col] = q_val;
 
         // K transposed directly in the shared memory tile
-        if (col < seq_len && k_row < head_dim) {
-            Kt_tile[local_col][local_row] = Kbh_base[col * head_dim + k_row];
-        } else {
-            Kt_tile[local_col][local_row] = 0.0f;
-        }
+        float kt_val =
+            (col < seq_len && k_row < head_dim) ? Kbh_base[col * head_dim + k_row] : 0.0f;
+        Kt_tile[local_col][local_row] = kt_val;
 
         __syncthreads();
 
@@ -73,37 +68,11 @@ __global__ void qk_dot_partial_reduce(float *Q, float *K, float *attn_scores,
     if (row < seq_len && col < seq_len) {
         attn_bh_base[row * seq_len + col] = acc;
     }
-
-    // Compute partial max (only max, no exp yet)
-    __shared__ float scores_tile[TILE_DIM][TILE_DIM + 1];
-
-    if (row < seq_len && col < seq_len) {
-        scores_tile[local_row][local_col] = acc;
-    } else {
-        scores_tile[local_row][local_col] = -CUDART_INF_F;
-    }
-    __syncthreads();
-
-    // Parallel reduction (max) across the tile columns
-    for (int offset = TILE_DIM >> 1; offset > 0; offset >>= 1) {
-        if (local_col < offset) {
-            float a = scores_tile[local_row][local_col];
-            float b = scores_tile[local_row][local_col + offset];
-            scores_tile[local_row][local_col] = (a > b) ? a : b;
-        }
-        __syncthreads();
-    }
-
-    // Write partial max to global memory
-    if (local_col == 0 && row < seq_len) {
-        int idx = ROW_OFFSET(bh_idx, row, seq_len, blocks_x) + blockIdx.x;
-        row_max_partials[idx] = scores_tile[local_row][0];
-    }
 }
 
 // Kernel: find global max and compute global sum
-__global__ void softmax_inplace(float *attention_scores, const float *row_max_partials, int seq_len,
-                                int partials_blocks_x) {
+__global__ void softmax_inplace_v2(float *attention_scores, const float *row_max_partials,
+                                   int seq_len, int partials_blocks_x) {
 
     int bh_idx = blockIdx.z;
     int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -159,8 +128,8 @@ __global__ void softmax_inplace(float *attention_scores, const float *row_max_pa
 }
 
 // Kernel: apply softmax and multiply by V
-__global__ void softmax_multV(const float *attention_scores, const float *V, float *O, int seq_len,
-                              int head_dim) {
+__global__ void softmax_multV_v2(const float *attention_scores, const float *V, float *O,
+                                 int seq_len, int head_dim) {
 
     int bh_idx = blockIdx.z;
     int block_row = blockIdx.y * TILE_DIM;
@@ -217,7 +186,7 @@ __global__ void softmax_multV(const float *attention_scores, const float *V, flo
 }
 
 // Simple attention implementation
-struct VanillaAttention : public Attention {
+struct VanillaAttentionV2 : public Attention {
 
     void forward(float *Q, float *K, float *V, float *O, int batch_size, int num_heads, int seq_len,
                  int head_dim) override {
@@ -225,6 +194,7 @@ struct VanillaAttention : public Attention {
         float *attention_scores;
         float *row_max_partials;
 
+        const float scale = 1.0f / sqrtf((float) head_dim);
         const size_t n_qkt = batch_size * num_heads * seq_len * seq_len;
         cudaMalloc(&attention_scores, n_qkt * sizeof(float));
 
@@ -237,8 +207,8 @@ struct VanillaAttention : public Attention {
         // Kernel 1: Compute QK^T and partial max values
         dim3 threads(TILE_DIM, TILE_DIM);
         dim3 grid(blocks_x, blocks_y, batch_size * num_heads);
-        qk_dot_partial_reduce<<<grid, threads>>>(Q, K, attention_scores, row_max_partials, seq_len,
-                                                 head_dim);
+        qk_dot_partial_reduce_v2<<<grid, threads>>>(Q, K, attention_scores, row_max_partials,
+                                                    seq_len, head_dim, scale);
         cudaDeviceSynchronize();
         CUDA_CHECK();
 
@@ -251,13 +221,13 @@ struct VanillaAttention : public Attention {
         dim3 threads2(per_row_threads, 1, 1);
         dim3 grid2(1, seq_len, batch_size * num_heads);
         int shared_bytes = per_row_threads * sizeof(float);
-        softmax_inplace<<<grid2, threads2, shared_bytes>>>(attention_scores, row_max_partials,
-                                                           seq_len, blocks_x);
+        softmax_inplace_v2<<<grid2, threads2, shared_bytes>>>(attention_scores, row_max_partials,
+                                                              seq_len, blocks_x);
         cudaDeviceSynchronize();
         CUDA_CHECK();
 
         // Kernel 3: Apply softmax and multiply by V
-        softmax_multV<<<grid, threads>>>(attention_scores, V, O, seq_len, head_dim);
+        softmax_multV_v2<<<grid, threads>>>(attention_scores, V, O, seq_len, head_dim);
         cudaDeviceSynchronize();
         CUDA_CHECK();
 
@@ -268,6 +238,6 @@ struct VanillaAttention : public Attention {
 };
 
 // Factory function
-extern "C" Attention *create_vanilla_attention() {
-    return new VanillaAttention();
+extern "C" Attention *create_vanilla_attention_v2() {
+    return new VanillaAttentionV2();
 }

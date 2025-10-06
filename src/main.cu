@@ -15,6 +15,7 @@
 
 // External factories
 extern "C" Attention *create_vanilla_attention();
+extern "C" Attention *create_vanilla_attention_v2();
 extern "C" Attention *create_vanilla_cublas_attention();
 
 struct BenchmarkEntry {
@@ -28,6 +29,9 @@ std::vector<std::unique_ptr<Benchmark>> get_selected_benchmarks(const std::set<s
     all_benchmarks.push_back(
         {"vanilla",
          std::make_unique<Benchmark>(get_benchmark_filename("vanilla"), create_vanilla_attention)});
+    all_benchmarks.push_back(
+        {"vanilla_v2", std::make_unique<Benchmark>(get_benchmark_filename("vanilla_v2"),
+                                                   create_vanilla_attention_v2)});
     all_benchmarks.push_back(
         {"vanilla_cublas", std::make_unique<Benchmark>(get_benchmark_filename("vanilla_cublas"),
                                                        create_vanilla_cublas_attention)});
