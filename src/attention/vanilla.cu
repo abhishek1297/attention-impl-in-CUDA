@@ -240,23 +240,29 @@ struct VanillaAttention : public Attention {
         qk_dot_partial_reduce<<<grid, threads>>>(Q, K, attention_scores, row_max_partials, seq_len,
                                                  head_dim);
         cudaDeviceSynchronize();
+        CUDA_CHECK();
 
         // save_device_ptr_as_buffer("QKt.bin", attention_scores, n_qkt);
         // Kernel 2:  Apply per row max and normalize with per row sum
-        int per_row_threads = max(TILE_DIM * blocks_x, 1024);
+        int device_max_threads;
+        cudaDeviceGetAttribute(&device_max_threads, cudaDevAttrMaxThreadsPerBlock, 0);
+        int per_row_threads = std::min(TILE_DIM * blocks_x, device_max_threads);
+        per_row_threads = std::max(32, per_row_threads);
         dim3 threads2(per_row_threads, 1, 1);
         dim3 grid2(1, seq_len, batch_size * num_heads);
         int shared_bytes = per_row_threads * sizeof(float);
         softmax_inplace<<<grid2, threads2, shared_bytes>>>(attention_scores, row_max_partials,
                                                            seq_len, blocks_x);
         cudaDeviceSynchronize();
-
+        CUDA_CHECK();
         // Kernel 3: Apply softmax and multiply by V
         softmax_multV<<<grid, threads>>>(attention_scores, V, O, seq_len, head_dim);
         cudaDeviceSynchronize();
+        CUDA_CHECK();
 
         cudaFree(attention_scores);
         cudaFree(row_max_partials);
+        CUDA_CHECK();
     }
 };
 

@@ -7,9 +7,9 @@
 #include <iostream>
 #include <string>
 
-#define CUDA_CHECK() cudaCheck(__FILE__, __LINE__)
+#define CUDA_CHECK() cuda_check(__FILE__, __LINE__)
 
-inline void cudaCheck(const char *file, int line) {
+inline void cuda_check(const char *file, int line) {
     cudaError_t err = cudaGetLastError(); // get last error from runtime
     if (err != cudaSuccess) {
         std::cerr << "CUDA Error: " << cudaGetErrorString(err) << " | File: " << file
