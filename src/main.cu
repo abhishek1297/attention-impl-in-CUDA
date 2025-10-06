@@ -65,6 +65,8 @@ int main() {
     std::vector<int> embed_dims = config["embed_dims"].as<std::vector<int>>();
     std::vector<int> num_attn_heads = config["num_attn_heads"].as<std::vector<int>>();
     std::vector<int> batch_sizes = config["batch_sizes"].as<std::vector<int>>();
+    bool save_bins = config["save_bins"].as<bool>();
+    uint total_runs_per_benchmark = config["runs_per_benchmark"].as<uint>();
 
     write_gpu_info();
     std::set<std::string> to_run;
@@ -90,14 +92,18 @@ int main() {
         float *K = mm.allocate_and_fill(qkv_elements);
         float *V = mm.allocate_and_fill(qkv_elements);
         float *O = mm.allocate_and_fill(qkv_elements, true);
-        // save_device_ptr_as_buffer("Q.bin", Q, qkv_elements);
-        // save_device_ptr_as_buffer("K.bin", K, qkv_elements);
-        // save_device_ptr_as_buffer("V.bin", V, qkv_elements);
+        if (save_bins) {
+            save_device_ptr_as_buffer("Q.bin", Q, qkv_elements);
+            save_device_ptr_as_buffer("K.bin", K, qkv_elements);
+            save_device_ptr_as_buffer("V.bin", V, qkv_elements);
+        }
 
         for (auto &bmark : benchmarks)
-            bmark->run(Q, K, V, O, batch_size, num_heads, seq_len, head_dim);
+            bmark->run(total_runs_per_benchmark, Q, K, V, O, batch_size, num_heads, seq_len,
+                       head_dim);
 
-        // save_device_ptr_as_buffer("O.bin", O, qkv_elements);
+        if (save_bins)
+            save_device_ptr_as_buffer("O.bin", O, qkv_elements);
         mm.free_all();
         std::cout << "Benchmark for batch_size=" << batch_size << ", num_heads=" << num_heads
                   << ", seq_len=" << seq_len << ", embed_dim=" << embed_dim << " finished."

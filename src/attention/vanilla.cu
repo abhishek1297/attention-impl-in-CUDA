@@ -10,7 +10,7 @@
 #define PARTIALS_PTR(arr, bh_idx, row, seq_len, blocks_x)                                          \
     ((arr) + ROW_OFFSET(bh_idx, row, seq_len, blocks_x))
 
-#define TILE_DIM 16
+#define TILE_DIM 32
 
 // Kernel: strided and batched QK^T with partial max reductions only
 __global__ void qk_dot_partial_reduce(float *Q, float *K, float *attn_scores,
@@ -255,6 +255,7 @@ struct VanillaAttention : public Attention {
                                                            seq_len, blocks_x);
         cudaDeviceSynchronize();
         CUDA_CHECK();
+
         // Kernel 3: Apply softmax and multiply by V
         softmax_multV<<<grid, threads>>>(attention_scores, V, O, seq_len, head_dim);
         cudaDeviceSynchronize();

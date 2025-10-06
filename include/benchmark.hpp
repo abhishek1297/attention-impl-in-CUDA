@@ -8,8 +8,6 @@
 #include <string>
 #include <vector>
 
-#define TOTAL_RUNS_PER_BENCHMARK 5
-
 class Benchmark {
   public:
     Benchmark(const std::string &filename, std::function<Attention *()> factory);
@@ -27,8 +25,8 @@ class Benchmark {
     double get_gflops(int batch_size, int num_heads, int seq_len, int head_dim,
                       float avg_time_ms) const;
 
-    void run(float *Q, float *K, float *V, float *O, int batch_size, int num_heads, int seq_len,
-             int head_dim);
+    void run(int total_runs, float *Q, float *K, float *V, float *O, int batch_size, int num_heads,
+             int seq_len, int head_dim);
 
   private:
     cudaEvent_t start_event = nullptr;

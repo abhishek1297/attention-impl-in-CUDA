@@ -48,15 +48,15 @@ double Benchmark::get_gflops(int batch_size, int num_heads, int seq_len, int hea
     return (flops / (avg_time_ms / 1000.0)) / 1e9;
 }
 
-void Benchmark::run(float *Q, float *K, float *V, float *O, int batch_size, int num_heads,
-                    int seq_len, int head_dim) {
+void Benchmark::run(int total_runs, float *Q, float *K, float *V, float *O, int batch_size,
+                    int num_heads, int seq_len, int head_dim) {
 
     Attention *attn = factory();
 
     // warm-up call
     attn->forward(Q, K, V, O, batch_size, num_heads, seq_len, head_dim);
 
-    for (int i = 0; i < TOTAL_RUNS_PER_BENCHMARK; ++i) {
+    for (int i = 0; i < total_runs; ++i) {
         start();
         attn->forward(Q, K, V, O, batch_size, num_heads, seq_len, head_dim);
         stop();
