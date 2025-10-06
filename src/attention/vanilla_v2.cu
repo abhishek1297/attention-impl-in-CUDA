@@ -10,6 +10,7 @@
 #define PARTIALS_PTR(arr, bh_idx, row, seq_len, blocks_x)                                          \
     ((arr) + ROW_OFFSET(bh_idx, row, seq_len, blocks_x))
 
+#define FULL_MASK 0xFFFFFFFF
 #define TILE_DIM 32
 
 // Kernel: strided and batched QK^T with partial max reductions only
@@ -67,6 +68,40 @@ __global__ void qk_dot_partial_reduce_v2(float *Q, float *K, float *attn_scores,
     // Write to global memory
     if (row < seq_len && col < seq_len) {
         attn_bh_base[row * seq_len + col] = acc;
+    }
+
+    // Find max (for numerical stability) assuming
+    // the entire warp belongs to a single row of the tile
+    int lane = local_col % 32;
+    int warpid = blockDim.x / 32;
+    int num_warps = blockDim.x % 32;
+    float max_score = acc;
+    // warp-level max reduce using shfl
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float nbr_score = __shfl_xor_sync(FULL_MASK, max_score, offset);
+        max_score = fmaxf(nbr_score, max_score);
+    }
+    // store warp-level max in the smem
+    if (num_warps > 1) {
+        extern __shared__ float warp_max_scores[];
+    
+        if (warpid == 0)
+            warp_max_scores[warpid] = max_score;
+        __syncthreads();
+
+        // block-level max reduce using shfl only at warp 0
+        if (warpid == 0) {
+            max_score = (lane < num_warps) ? warp_max_scores[lane] : -CUDART_INF_F;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                float nbr_score = __shfl_xor_sync(FULL_MASK, max_score, offset);
+                max_score = fmaxf(nbr_score, max_score);
+            }
+        }
+    }
+    // write per-block row partial maxes to global memory
+    if (local_col == 0 && row < seq_len) {
+        int idx = ROW_OFFSET(bh_idx, row, seq_len, blocks_x) + blockIdx.x;
+        row_max_partials[idx] = max_score;
     }
 }
 
@@ -207,7 +242,9 @@ struct VanillaAttentionV2 : public Attention {
         // Kernel 1: Compute QK^T and partial max values
         dim3 threads(TILE_DIM, TILE_DIM);
         dim3 grid(blocks_x, blocks_y, batch_size * num_heads);
-        qk_dot_partial_reduce_v2<<<grid, threads>>>(Q, K, attention_scores, row_max_partials,
+        const int num_warps_in_x = TILE_DIM % 32;
+        int shared_bytes = num_warps_in_x * sizeof(float);
+        qk_dot_partial_reduce_v2<<<grid, threads, shared_bytes>>>(Q, K, attention_scores, row_max_partials,
                                                     seq_len, head_dim, scale);
         cudaDeviceSynchronize();
         CUDA_CHECK();
@@ -220,7 +257,7 @@ struct VanillaAttentionV2 : public Attention {
         per_row_threads = std::max(32, per_row_threads);
         dim3 threads2(per_row_threads, 1, 1);
         dim3 grid2(1, seq_len, batch_size * num_heads);
-        int shared_bytes = per_row_threads * sizeof(float);
+        shared_bytes = per_row_threads * sizeof(float);
         softmax_inplace_v2<<<grid2, threads2, shared_bytes>>>(attention_scores, row_max_partials,
                                                               seq_len, blocks_x);
         cudaDeviceSynchronize();
