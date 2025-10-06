@@ -14,7 +14,7 @@
 #define TILE_DIM 32
 
 // Kernel: strided and batched QK^T with partial max reductions only
-__global__ void qk_dot_partial_reduce_v2(float *Q, float *K, float *attn_scores,
+__global__ void qk_dot_partial_reduce_v2(const float *Q, const float *K, float *attn_scores,
                                          float *row_max_partials, int seq_len, int head_dim,
                                          const float scale) {
 
@@ -54,9 +54,25 @@ __global__ void qk_dot_partial_reduce_v2(float *Q, float *K, float *attn_scores,
 
         __syncthreads();
 
+// pre-fetching 4 floats at a time to vectorize inner product
 #pragma unroll
-        for (int k = 0; k < TILE_DIM; ++k) {
-            acc += Q_tile[local_row][k] * Kt_tile[local_col][k];
+        for (int k = 0; k < TILE_DIM; k += 4) {
+            float4 q_vec;
+            q_vec.x = Q_tile[local_row][k + 0];
+            q_vec.y = Q_tile[local_row][k + 1];
+            q_vec.z = Q_tile[local_row][k + 2];
+            q_vec.w = Q_tile[local_row][k + 3];
+
+            float4 k_vec;
+            k_vec.x = Kt_tile[local_col][k + 0];
+            k_vec.y = Kt_tile[local_col][k + 1];
+            k_vec.z = Kt_tile[local_col][k + 2];
+            k_vec.w = Kt_tile[local_col][k + 3];
+
+            acc = fmaf(q_vec.x, k_vec.x, acc);
+            acc = fmaf(q_vec.y, k_vec.y, acc);
+            acc = fmaf(q_vec.z, k_vec.z, acc);
+            acc = fmaf(q_vec.w, k_vec.w, acc);
         }
 
         __syncthreads();
@@ -74,7 +90,7 @@ __global__ void qk_dot_partial_reduce_v2(float *Q, float *K, float *attn_scores,
     // the entire warp belongs to a single row of the tile
     int lane = local_col % 32;
     int warpid = blockDim.x / 32;
-    int num_warps = blockDim.x % 32;
+    int num_warps = blockDim.x / 32;
     float max_score = acc;
     // warp-level max reduce using shfl
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -84,16 +100,17 @@ __global__ void qk_dot_partial_reduce_v2(float *Q, float *K, float *attn_scores,
     // store warp-level max in the smem
     if (num_warps > 1) {
         extern __shared__ float warp_max_scores[];
-    
-        if (warpid == 0)
+
+        if (lane == 0)
             warp_max_scores[warpid] = max_score;
         __syncthreads();
 
+        unsigned mask = (1U << num_warps) - 1;
         // block-level max reduce using shfl only at warp 0
         if (warpid == 0) {
             max_score = (lane < num_warps) ? warp_max_scores[lane] : -CUDART_INF_F;
             for (int offset = 16; offset > 0; offset >>= 1) {
-                float nbr_score = __shfl_xor_sync(FULL_MASK, max_score, offset);
+                float nbr_score = __shfl_xor_sync(mask, max_score, offset);
                 max_score = fmaxf(nbr_score, max_score);
             }
         }
@@ -223,8 +240,8 @@ __global__ void softmax_multV_v2(const float *attention_scores, const float *V, 
 // Simple attention implementation
 struct VanillaAttentionV2 : public Attention {
 
-    void forward(float *Q, float *K, float *V, float *O, int batch_size, int num_heads, int seq_len,
-                 int head_dim) override {
+    void forward(const float *Q, const float *K, const float *V, float *O, uint32_t batch_size,
+                 uint32_t num_heads, uint32_t seq_len, uint32_t head_dim) override {
 
         float *attention_scores;
         float *row_max_partials;
@@ -242,10 +259,10 @@ struct VanillaAttentionV2 : public Attention {
         // Kernel 1: Compute QK^T and partial max values
         dim3 threads(TILE_DIM, TILE_DIM);
         dim3 grid(blocks_x, blocks_y, batch_size * num_heads);
-        const int num_warps_in_x = TILE_DIM % 32;
+        const int num_warps_in_x = TILE_DIM / 32;
         int shared_bytes = num_warps_in_x * sizeof(float);
-        qk_dot_partial_reduce_v2<<<grid, threads, shared_bytes>>>(Q, K, attention_scores, row_max_partials,
-                                                    seq_len, head_dim, scale);
+        qk_dot_partial_reduce_v2<<<grid, threads, shared_bytes>>>(
+            Q, K, attention_scores, row_max_partials, seq_len, head_dim, scale);
         cudaDeviceSynchronize();
         CUDA_CHECK();
 
