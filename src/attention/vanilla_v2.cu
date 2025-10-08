@@ -2,21 +2,28 @@
 #include "cuda_utils.hpp"
 
 #include <cmath>
+#include <cooperative_groups.h>
 #include <cstdio>
 #include <cuda_runtime.h>
 #include <iostream>
 #include <math_constants.h>
 
+namespace cg = cooperative_groups;
+
 #define PARTIALS_PTR(arr, bh_idx, row, seq_len, blocks_x)                                          \
     ((arr) + ROW_OFFSET(bh_idx, row, seq_len, blocks_x))
 
-#define FULL_MASK 0xFFFFFFFF
 #define TILE_DIM 32
 
 // Kernel: strided and batched QK^T with partial max reductions only
 __global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q, const float *__restrict__ K,
                                          float *attn_scores, float *row_max_partials, int seq_len,
                                          int head_dim, const float scale) {
+
+    // cooperative-groups block object
+    cg::thread_block cg_block = cg::this_thread_block();
+    // create a warp-sized tile group
+    auto warp = cg::tiled_partition<TILE_DIM>(cg_block);
 
     int bh_idx = blockIdx.z;
     int blocks_x = gridDim.x;
@@ -34,12 +41,12 @@ __global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q, const floa
     float *attn_bh_base = ATTN_PTR(attn_scores, bh_idx, seq_len);
 
     __shared__ float Q_tile[TILE_DIM][TILE_DIM];
-    __shared__ float Kt_tile[TILE_DIM][TILE_DIM + 1]; // avoid bank conflicts by padding
+    __shared__ float Kt_tile[TILE_DIM][TILE_DIM + 1]; // padding
 
     float acc = 0.0f;
 
+    // per-thread workload
     int num_tiles = (head_dim + TILE_DIM - 1) / TILE_DIM;
-
     for (int t = 0; t < num_tiles; ++t) {
         int q_col = t * TILE_DIM + local_col;
         int k_row = t * TILE_DIM + local_row;
@@ -47,14 +54,14 @@ __global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q, const floa
         float q_val = (row < seq_len && q_col < head_dim) ? Qbh_base[row * head_dim + q_col] : 0.0f;
         Q_tile[local_row][local_col] = q_val;
 
-        // K transposed directly in the shared memory tile
+        // note transpose
         float kt_val =
             (col < seq_len && k_row < head_dim) ? Kbh_base[col * head_dim + k_row] : 0.0f;
         Kt_tile[local_col][local_row] = kt_val;
 
-        __syncthreads();
+        cg_block.sync();
 
-// pre-fetching 4 floats at a time to vectorize inner product
+        // inner product for this tile vectorized in groups of 4
 #pragma unroll
         for (int k = 0; k < TILE_DIM; k += 4) {
             float4 q_vec;
@@ -74,48 +81,51 @@ __global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q, const floa
             acc = fmaf(q_vec.z, k_vec.z, acc);
             acc = fmaf(q_vec.w, k_vec.w, acc);
         }
-
-        __syncthreads();
+        cg_block.sync();
     }
 
-    // Apply scaling factor
     acc *= scale;
 
-    // Write to global memory
     if (row < seq_len && col < seq_len) {
         attn_bh_base[row * seq_len + col] = acc;
     }
 
-    // Find max (for numerical stability) assuming
-    // the entire warp belongs to a single row of the tile
-    int lane = local_col % 32;
-    int warpid = blockDim.x / 32;
-    int num_warps = blockDim.x / 32;
+    int warps_per_row = (blockDim.x + warp.size() - 1) / warp.size();
+
+    // per-warp max scores i.e each thread in a warp will hold the same max value
     float max_score = acc;
-    // warp-level max reduce using shfl
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        float nbr_score = __shfl_xor_sync(FULL_MASK, max_score, offset);
-        max_score = fmaxf(nbr_score, max_score);
+    for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
+        float other = warp.shfl_xor(max_score, offset);
+        max_score = fmaxf(max_score, other);
     }
-    // store warp-level max in the smem
-    if (num_warps > 1) {
+
+    if (warps_per_row > 1) {
         extern __shared__ float warp_max_scores[];
-
-        if (lane == 0)
-            warp_max_scores[warpid] = max_score;
-        __syncthreads();
-
-        unsigned mask = (1U << num_warps) - 1;
-        // block-level max reduce using shfl only at warp 0
-        if (warpid == 0) {
-            max_score = (lane < num_warps) ? warp_max_scores[lane] : -CUDART_INF_F;
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                float nbr_score = __shfl_xor_sync(mask, max_score, offset);
-                max_score = fmaxf(nbr_score, max_score);
-            }
+        int warp_id_row = threadIdx.y;
+        int warp_id_col = threadIdx.x / warp.size();
+        // thread 0 per-warp loads its max score
+        if (warp.thread_rank() == 0) {
+            warp_max_scores[warp_id_row * warps_per_row + warp_id_col] = max_score;
         }
+        cg_block.sync();
+
+        // block-level reduction for max scores per row of a block
+        if (warp_id_col == 0) {
+            int warp_col_fetch_id = warp.thread_rank();
+            float val = (warp_col_fetch_id < warps_per_row)
+                            ? warp_max_scores[warp_id_row * warps_per_row + warp_col_fetch_id]
+                            : -CUDART_INF_F;
+            for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
+                float other = warp.shfl_xor(val, offset);
+                max_score = fmaxf(val, other);
+            }
+            max_score = val;
+        }
+        cg_block.sync();
     }
-    // write per-block row partial maxes to global memory
+
+    // write per-block row partial maxes to global memory from the first column in tile (local_col
+    // == 0)
     if (local_col == 0 && row < seq_len) {
         int idx = ROW_OFFSET(bh_idx, row, seq_len, blocks_x) + blockIdx.x;
         row_max_partials[idx] = max_score;
