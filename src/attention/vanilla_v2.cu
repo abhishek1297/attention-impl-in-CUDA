@@ -1,6 +1,7 @@
 #include "attention.hpp"
 #include "cuda_utils.hpp"
 
+#include <cassert>
 #include <cmath>
 #include <cooperative_groups.h>
 #include <cstdio>
@@ -12,8 +13,65 @@ namespace cg = cooperative_groups;
 
 #define PARTIALS_PTR(arr, bh_idx, row, seq_len, blocks_x)                                          \
     ((arr) + ROW_OFFSET(bh_idx, row, seq_len, blocks_x))
-
 #define TILE_DIM 32
+
+__device__ float atomicMaxFloat(float *addr, float value) {
+    int *addr_as_int = reinterpret_cast<int *>(addr);
+    int old = *addr_as_int, assumed;
+
+    do {
+        assumed = old;
+        float old_val = __int_as_float(assumed);
+        if (old_val >= value)
+            break;
+        old = atomicCAS(addr_as_int, assumed, __float_as_int(value));
+    } while (assumed != old);
+
+    return __int_as_float(old);
+}
+
+__device__ float reduce_tile_row_maxes(cg::thread_block cg_block, float score,
+                                       float *block_smem_scores) {
+    // create a warp-sized tile group
+    auto warp = cg::tiled_partition<32>(cg_block);
+    int lane = warp.thread_rank();
+    int warps_per_row = (TILE_DIM + warp.size() - 1) / warp.size();
+
+    // per-warp max scores i.e each thread in a warp will hold the same max value
+    float max_score = score;
+    for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
+        float other = warp.shfl_xor(max_score, offset);
+        max_score = fmaxf(max_score, other);
+    }
+
+    // each block-row has more than 1 warps
+    if (warps_per_row > 1) {
+        int warp_id_row = threadIdx.y;
+        int warp_id_col = threadIdx.x / warp.size();
+        // thread 0 per-warp loads its max scores in smem
+        if (lane == 0) {
+            int idx = warp_id_row * warps_per_row + warp_id_col;
+            block_smem_scores[idx] = max_score;
+        }
+        cg_block.sync();
+
+        // first warp of every block-row
+        if (warp_id_col == 0) {
+            // the same number of threads as the warps per block-row
+            int idx = warp_id_row * warps_per_row + lane;
+            max_score = (lane < warps_per_row) ? block_smem_scores[idx] : -CUDART_INF_F;
+
+            for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
+                float other = warp.shfl_xor(max_score, offset);
+                max_score = fmaxf(max_score, other);
+            }
+        }
+        cg_block.sync();
+    }
+    // at this point, column 0 of each block will hold max per block
+
+    return max_score;
+}
 
 // Kernel: strided and batched QK^T with partial max reductions only
 __global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q, const float *__restrict__ K,
@@ -22,8 +80,6 @@ __global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q, const floa
 
     // cooperative-groups block object
     cg::thread_block cg_block = cg::this_thread_block();
-    // create a warp-sized tile group
-    auto warp = cg::tiled_partition<TILE_DIM>(cg_block);
 
     int bh_idx = blockIdx.z;
     int blocks_x = gridDim.x;
@@ -43,7 +99,7 @@ __global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q, const floa
     __shared__ float Q_tile[TILE_DIM][TILE_DIM];
     __shared__ float Kt_tile[TILE_DIM][TILE_DIM + 1]; // padding
 
-    float acc = 0.0f;
+    float score = 0.0f;
 
     // per-thread workload
     int num_tiles = (head_dim + TILE_DIM - 1) / TILE_DIM;
@@ -64,6 +120,7 @@ __global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q, const floa
         // inner product for this tile vectorized in groups of 4
 #pragma unroll
         for (int k = 0; k < TILE_DIM; k += 4) {
+
             float4 q_vec;
             q_vec.x = Q_tile[local_row][k + 0];
             q_vec.y = Q_tile[local_row][k + 1];
@@ -76,57 +133,23 @@ __global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q, const floa
             k_vec.z = Kt_tile[local_col][k + 2];
             k_vec.w = Kt_tile[local_col][k + 3];
 
-            acc = fmaf(q_vec.x, k_vec.x, acc);
-            acc = fmaf(q_vec.y, k_vec.y, acc);
-            acc = fmaf(q_vec.z, k_vec.z, acc);
-            acc = fmaf(q_vec.w, k_vec.w, acc);
+            score = fmaf(q_vec.x, k_vec.x, score);
+            score = fmaf(q_vec.y, k_vec.y, score);
+            score = fmaf(q_vec.z, k_vec.z, score);
+            score = fmaf(q_vec.w, k_vec.w, score);
         }
         cg_block.sync();
     }
 
-    acc *= scale;
-
+    score *= scale;
     if (row < seq_len && col < seq_len) {
-        attn_bh_base[row * seq_len + col] = acc;
+        attn_bh_base[row * seq_len + col] = score;
     }
-
-    int warps_per_row = (blockDim.x + warp.size() - 1) / warp.size();
-
-    // per-warp max scores i.e each thread in a warp will hold the same max value
-    float max_score = acc;
-    for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
-        float other = warp.shfl_xor(max_score, offset);
-        max_score = fmaxf(max_score, other);
-    }
-
-    if (warps_per_row > 1) {
-        extern __shared__ float warp_max_scores[];
-        int warp_id_row = threadIdx.y;
-        int warp_id_col = threadIdx.x / warp.size();
-        // thread 0 per-warp loads its max score
-        if (warp.thread_rank() == 0) {
-            warp_max_scores[warp_id_row * warps_per_row + warp_id_col] = max_score;
-        }
-        cg_block.sync();
-
-        // block-level reduction for max scores per row of a block
-        if (warp_id_col == 0) {
-            int warp_col_fetch_id = warp.thread_rank();
-            float val = (warp_col_fetch_id < warps_per_row)
-                            ? warp_max_scores[warp_id_row * warps_per_row + warp_col_fetch_id]
-                            : -CUDART_INF_F;
-            for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
-                float other = warp.shfl_xor(val, offset);
-                max_score = fmaxf(val, other);
-            }
-            max_score = val;
-        }
-        cg_block.sync();
-    }
-
-    // write per-block row partial maxes to global memory from the first column in tile (local_col
-    // == 0)
     if (local_col == 0 && row < seq_len) {
+        extern __shared__ float block_smem_scores[];
+        // reduced per block
+        float max_score = reduce_tile_row_maxes(cg_block, score, block_smem_scores);
+        // write partial maxes per-block to global memory
         int idx = ROW_OFFSET(bh_idx, row, seq_len, blocks_x) + blockIdx.x;
         row_max_partials[idx] = max_score;
     }
@@ -137,9 +160,17 @@ __global__ void softmax_inplace_v2(float *attention_scores,
                                    const float *__restrict__ row_max_partials, int seq_len,
                                    int partials_blocks_x) {
 
+    // cooperative-groups block object
+    cg::thread_block cg_block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<32>(cg_block);
+    int lane = warp.thread_rank();
+
     int bh_idx = blockIdx.z;
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int tid = threadIdx.x;
+
+    int warp_id = tid / warp.size();
+    int num_warps = (blockDim.x + warp.size() - 1) / warp.size();
 
     if (row >= seq_len)
         return;
@@ -148,43 +179,89 @@ __global__ void softmax_inplace_v2(float *attention_scores,
         PARTIALS_PTR(row_max_partials, bh_idx, row, seq_len, partials_blocks_x);
 
     // Find max (for numerical stability)
-    float row_max;
-    __shared__ float shared_row_max;
-    if (tid == 0) {
-        row_max = -CUDART_INF_F;
-        for (int bx = 0; bx < partials_blocks_x; bx++) {
-            float block_max = row_max_bh_base[bx];
-            if (block_max > row_max)
-                row_max = block_max;
-        }
-        shared_row_max = row_max;
+    float max_score = -CUDART_INF_F;
+    extern __shared__ float warp_row_maxes[];
+    if (lane == 0) {
+        warp_row_maxes[warp_id] = -CUDART_INF_F;
     }
-    // synchronize row max from thread 0 to all
-    __syncthreads();
-    row_max = shared_row_max;
+    cg_block.sync();
 
-    // Compute sum of exp(score - row_max) across all columns
+    int bx = warp_id * warp.size() + lane;
+    for (; bx < partials_blocks_x; bx += blockDim.x) {
+        max_score = row_max_bh_base[bx];
+
+        for (int offset = warp.size() / 2; offset > 0; offset >>= 1)
+            max_score = fmaxf(max_score, warp.shfl_xor(max_score, offset));
+
+        // note that this will be strided max finds
+        if (lane == 0)
+            warp_row_maxes[warp_id] = fmaxf(max_score, warp_row_maxes[warp_id]);
+    }
+    cg_block.sync();
+
+    // one more reduction across smem collected maxes
+    // this code assumes you can launch at most 32x32 warps over a block
+    if (warp_id == 0) {
+        for (int i = 0; i < num_warps; i += warp.size()) {
+            if (lane + i < num_warps)
+                max_score = warp_row_maxes[lane + i];
+            for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
+                float other = warp.shfl_xor(max_score, offset);
+                max_score = fmaxf(max_score, other);
+            }
+            if (lane == 0)
+                warp_row_maxes[0] = fmaxf(max_score, warp_row_maxes[0]);
+        }
+    }
+    cg_block.sync();
+    max_score = warp_row_maxes[0];
+
+    // compute sum of exp(score - row_max) across all columns
     float *attn_bh_base = ATTN_PTR(attention_scores, bh_idx, seq_len);
-    float row_sum = 0.0f;
+    float strided_sum_score = 0.0f;
 
     for (int col = tid; col < seq_len; col += blockDim.x) {
         int idx = row * seq_len + col;
-        float score = expf(attn_bh_base[idx] - row_max);
-        row_sum += score;
+        float score = expf(attn_bh_base[idx] - max_score);
+        strided_sum_score += score;
         attn_bh_base[idx] = score;
     }
 
-    extern __shared__ float shared_sum[];
-    shared_sum[tid] = row_sum;
-    __syncthreads();
-    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
-        if (tid < offset)
-            shared_sum[tid] += shared_sum[tid + offset];
-        __syncthreads();
+    cg_block.sync();
+    // at this point each thread of the single block will have the strided sum
+
+    extern __shared__ float warp_row_sums[];
+    __shared__ float row_sum_score[1];
+    if (warp_id == 0 && lane == 0)
+        row_sum_score[0] = 0.0f;
+    cg_block.sync();
+    // only single reduction workload left at this point
+    // per-warp sum scores i.e thread 0 will hold the final sum
+    for (int offset = warp.size() / 2; offset > 0; offset >>= 1)
+        strided_sum_score += warp.shfl_down(strided_sum_score, offset);
+
+    if (lane == 0) {
+        warp_row_sums[warp_id] = strided_sum_score;
     }
+    cg_block.sync();
+
+    // one more reduction across smem collected sums
+    // this code assumes you can launch at most 32x32 warps over a block
+    if (warp_id == 0) {
+        for (int i = 0; i < num_warps; i += warp.size()) {
+            strided_sum_score = (lane + i < num_warps) ? warp_row_sums[lane + i] : 0.0f;
+            for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
+                strided_sum_score += warp.shfl_down(strided_sum_score, offset);
+            }
+            if (lane == 0) {
+                row_sum_score[0] += strided_sum_score;
+            }
+        }
+    }
+    cg_block.sync();
 
     // normalize attention scores
-    const float norm = 1 / shared_sum[0];
+    const float norm = 1 / row_sum_score[0];
     for (int col = tid; col < seq_len; col += blockDim.x) {
         attn_bh_base[row * seq_len + col] *= norm;
     }
@@ -254,6 +331,10 @@ struct VanillaAttentionV2 : public Attention {
     void forward(const float *Q, const float *K, const float *V, float *O, uint32_t batch_size,
                  uint32_t num_heads, uint32_t seq_len, uint32_t head_dim) override {
 
+        int warp_size;
+        cudaDeviceGetAttribute(&warp_size, cudaDevAttrWarpSize, 0);
+        assert(TILE_DIM >= warp_size && TILE_DIM % warp_size == 0);
+
         float *attention_scores;
         float *row_max_partials;
 
@@ -270,24 +351,26 @@ struct VanillaAttentionV2 : public Attention {
         // Kernel 1: Compute QK^T and partial max values
         dim3 threads(TILE_DIM, TILE_DIM);
         dim3 grid(blocks_x, blocks_y, batch_size * num_heads);
-        const int num_warps_in_x = TILE_DIM / 32;
-        int shared_bytes = num_warps_in_x * sizeof(float);
+        int warps_per_block = TILE_DIM * (TILE_DIM / warp_size);
+        int shared_bytes = warps_per_block * sizeof(float);
         qk_dot_partial_reduce_v2<<<grid, threads, shared_bytes>>>(
             Q, K, attention_scores, row_max_partials, seq_len, head_dim, scale);
         cudaDeviceSynchronize();
         CUDA_CHECK();
 
         // save_device_ptr_as_buffer("QKt.bin", attention_scores, n_qkt);
+
         // Kernel 2:  Apply per row max and normalize with per row sum
         int device_max_threads;
         cudaDeviceGetAttribute(&device_max_threads, cudaDevAttrMaxThreadsPerBlock, 0);
-        int per_row_threads = std::min(TILE_DIM * blocks_x, device_max_threads);
-        per_row_threads = std::max(32, per_row_threads);
-        dim3 threads2(per_row_threads, 1, 1);
+        int per_row_block_threads = std::min(TILE_DIM * blocks_x, device_max_threads);
+        per_row_block_threads = std::max(warp_size, per_row_block_threads);
+        warps_per_block = per_row_block_threads / warp_size;
+        dim3 threads2(per_row_block_threads, 1, 1);
         dim3 grid2(1, seq_len, batch_size * num_heads);
-        shared_bytes = per_row_threads * sizeof(float);
-        softmax_inplace_v2<<<grid2, threads2, shared_bytes>>>(attention_scores, row_max_partials,
-                                                              seq_len, blocks_x);
+        shared_bytes = 2 * warps_per_block * sizeof(float);
+        softmax_inplace_v2<<<grid2, threads2>>>(attention_scores, row_max_partials, seq_len,
+                                                blocks_x);
         cudaDeviceSynchronize();
         CUDA_CHECK();
 
@@ -305,4 +388,45 @@ struct VanillaAttentionV2 : public Attention {
 // Factory function
 extern "C" Attention *create_vanilla_attention_v2() {
     return new VanillaAttentionV2();
+}
+
+__device__ float reduce_block_row_sums(cg::thread_block cg_block, float score,
+                                       float *block_smem_scores) {
+    // create a warp-sized tile group
+    auto warp = cg::tiled_partition<32>(cg_block);
+    int lane = warp.thread_rank();
+    int warps_per_row = (TILE_DIM + warp.size() - 1) / warp.size();
+
+    // per-warp sum scores i.e thread 0 will hold the final sum
+    float sum_score = score;
+    for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
+        sum_score += warp.shfl_down(sum_score, offset);
+    }
+
+    // each block-row has more than 1 warps
+    if (warps_per_row > 1) {
+        int warp_id_row = threadIdx.y;
+        int warp_id_col = threadIdx.x / warp.size();
+        // thread 0 per-warp loads its sum scores in smem
+        if (lane == 0) {
+            int idx = warp_id_row * warps_per_row + warp_id_col;
+            block_smem_scores[idx] = sum_score;
+        }
+        cg_block.sync();
+
+        // first warp of every block-row
+        if (warp_id_col == 0) {
+            // the same number of threads as the warps per block-row
+            int idx = warp_id_row * warps_per_row + lane;
+            sum_score = (lane < warps_per_row) ? block_smem_scores[idx] : 0.0f;
+
+            for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
+                sum_score += warp.shfl_down(sum_score, offset);
+            }
+        }
+        cg_block.sync();
+    }
+    // at this point, column 0 of each block will hold sum per block
+
+    return sum_score;
 }
