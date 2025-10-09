@@ -15,21 +15,6 @@ namespace cg = cooperative_groups;
     ((arr) + ROW_OFFSET(bh_idx, row, seq_len, blocks_x))
 #define TILE_DIM 32
 
-__device__ float atomicMaxFloat(float *addr, float value) {
-    int *addr_as_int = reinterpret_cast<int *>(addr);
-    int old = *addr_as_int, assumed;
-
-    do {
-        assumed = old;
-        float old_val = __int_as_float(assumed);
-        if (old_val >= value)
-            break;
-        old = atomicCAS(addr_as_int, assumed, __float_as_int(value));
-    } while (assumed != old);
-
-    return __int_as_float(old);
-}
-
 __device__ float reduce_tile_row_maxes(cg::thread_block cg_block, float score,
                                        float *block_smem_scores) {
     // create a warp-sized tile group
@@ -178,21 +163,23 @@ __global__ void softmax_inplace_v2(float *attention_scores,
     const float *row_max_bh_base =
         PARTIALS_PTR(row_max_partials, bh_idx, row, seq_len, partials_blocks_x);
 
-    // Find max (for numerical stability)
-    float max_score = -CUDART_INF_F;
+    // find max (for numerical stability)
+    float max_score;
     extern __shared__ float warp_row_maxes[];
     if (lane == 0) {
         warp_row_maxes[warp_id] = -CUDART_INF_F;
     }
     cg_block.sync();
 
-    int bx = warp_id * warp.size() + lane;
-    for (; bx < partials_blocks_x; bx += blockDim.x) {
-        max_score = row_max_bh_base[bx];
+    int n_strides = (partials_blocks_x + blockDim.x - 1) / blockDim.x;
+    for (int s = 0; s < n_strides; s++) {
+        int bx = s * blockDim.x + warp_id * warp.size() + lane;
+        max_score = (bx < partials_blocks_x) ? row_max_bh_base[bx] : -CUDART_INF_F;
 
-        for (int offset = warp.size() / 2; offset > 0; offset >>= 1)
-            max_score = fmaxf(max_score, warp.shfl_xor(max_score, offset));
-
+        for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
+            float other = warp.shfl_xor(max_score, offset);
+            max_score = fmaxf(max_score, other);
+        }
         // note that this will be strided max finds
         if (lane == 0)
             warp_row_maxes[warp_id] = fmaxf(max_score, warp_row_maxes[warp_id]);
@@ -227,22 +214,22 @@ __global__ void softmax_inplace_v2(float *attention_scores,
         attn_bh_base[idx] = score;
     }
 
-    cg_block.sync();
     // at this point each thread of the single block will have the strided sum
+    cg_block.sync();
 
     extern __shared__ float warp_row_sums[];
     __shared__ float row_sum_score[1];
     if (warp_id == 0 && lane == 0)
         row_sum_score[0] = 0.0f;
     cg_block.sync();
+
     // only single reduction workload left at this point
     // per-warp sum scores i.e thread 0 will hold the final sum
     for (int offset = warp.size() / 2; offset > 0; offset >>= 1)
         strided_sum_score += warp.shfl_down(strided_sum_score, offset);
 
-    if (lane == 0) {
+    if (lane == 0)
         warp_row_sums[warp_id] = strided_sum_score;
-    }
     cg_block.sync();
 
     // one more reduction across smem collected sums
@@ -253,9 +240,8 @@ __global__ void softmax_inplace_v2(float *attention_scores,
             for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
                 strided_sum_score += warp.shfl_down(strided_sum_score, offset);
             }
-            if (lane == 0) {
+            if (lane == 0)
                 row_sum_score[0] += strided_sum_score;
-            }
         }
     }
     cg_block.sync();
@@ -429,4 +415,19 @@ __device__ float reduce_block_row_sums(cg::thread_block cg_block, float score,
     // at this point, column 0 of each block will hold sum per block
 
     return sum_score;
+}
+
+__device__ float atomicMaxFloat(float *addr, float value) {
+    int *addr_as_int = reinterpret_cast<int *>(addr);
+    int old = *addr_as_int, assumed;
+
+    do {
+        assumed = old;
+        float old_val = __int_as_float(assumed);
+        if (old_val >= value)
+            break;
+        old = atomicCAS(addr_as_int, assumed, __float_as_int(value));
+    } while (assumed != old);
+
+    return __int_as_float(old);
 }

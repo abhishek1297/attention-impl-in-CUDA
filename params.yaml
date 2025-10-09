@@ -1,6 +1,6 @@
 save_bins: false
-seq_lengths: [512, 1024, 4096]
-embed_dims: [2048, 4096, 8192]
+seq_lengths: [128, 512, 1024, 4096]
+embed_dims: [128, 2048, 4096, 8192]
 num_attn_heads: [1, 4, 8, 16]
 batch_sizes: [1]
 runs_per_benchmark: 5
