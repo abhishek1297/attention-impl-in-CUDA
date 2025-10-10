@@ -15,6 +15,37 @@ namespace cg = cooperative_groups;
     ((arr) + ROW_OFFSET(bh_idx, row, seq_len, blocks_x))
 #define TILE_DIM 32
 
+// Kernel: Strided and Batched Transpose K
+__global__ void transpose_K(const float *__restrict__ K, float *__restrict__ K_transposed,
+                            int seq_len, int head_dim) {
+
+    int bh_idx = blockIdx.z;
+    int block_row = blockIdx.y * TILE_DIM;
+    int block_col = blockIdx.x * TILE_DIM;
+
+    int local_row = threadIdx.y;
+    int local_col = threadIdx.x;
+
+    int row = block_row + local_row;
+    int col = block_col + local_col;
+
+    __shared__ float tile[TILE_DIM][TILE_DIM + 1]; // +1 to avoid bank conflicts
+
+    const float *Kbh_base = K_PTR(K, bh_idx, seq_len, head_dim);
+    float *Kt_bh_base = K_PTR(K_transposed, bh_idx, head_dim, seq_len);
+
+    tile[local_row][local_col] =
+        (row < seq_len && col < head_dim) ? Kbh_base[row * head_dim + col] : 0.0f;
+    __syncthreads();
+
+    int trans_row = block_col + local_row; // head_dim dimension (was col)
+    int trans_col = block_row + local_col; // seq_len dimension (was row)
+
+    if (trans_row < head_dim && trans_col < seq_len) {
+        Kt_bh_base[trans_row * seq_len + trans_col] = tile[local_col][local_row];
+    }
+}
+
 __device__ float reduce_tile_row_maxes(cg::thread_block cg_block, float score,
                                        float *block_smem_scores) {
     // create a warp-sized tile group
@@ -24,10 +55,12 @@ __device__ float reduce_tile_row_maxes(cg::thread_block cg_block, float score,
 
     // per-warp max scores i.e each thread in a warp will hold the same max value
     float max_score = score;
+    warp.sync();
     for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
         float other = warp.shfl_xor(max_score, offset);
         max_score = fmaxf(max_score, other);
     }
+    warp.sync();
 
     // each block-row has more than 1 warps
     if (warps_per_row > 1) {
@@ -45,6 +78,7 @@ __device__ float reduce_tile_row_maxes(cg::thread_block cg_block, float score,
             // the same number of threads as the warps per block-row
             int idx = warp_id_row * warps_per_row + lane;
             max_score = (lane < warps_per_row) ? block_smem_scores[idx] : -CUDART_INF_F;
+            warp.sync();
 
             for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
                 float other = warp.shfl_xor(max_score, offset);
@@ -59,9 +93,10 @@ __device__ float reduce_tile_row_maxes(cg::thread_block cg_block, float score,
 }
 
 // Kernel: strided and batched QK^T with partial max reductions only
-__global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q, const float *__restrict__ K,
-                                         float *attn_scores, float *row_max_partials, int seq_len,
-                                         int head_dim, const float scale) {
+__global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q,
+                                         const float *__restrict__ K_transposed, float *attn_scores,
+                                         float *row_max_partials, int seq_len, int head_dim,
+                                         const float scale) {
 
     // cooperative-groups block object
     cg::thread_block cg_block = cg::this_thread_block();
@@ -78,11 +113,11 @@ __global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q, const floa
     int col = block_col + local_col;
 
     const float *Qbh_base = Q_PTR(Q, bh_idx, seq_len, head_dim);
-    const float *Kbh_base = K_PTR(K, bh_idx, seq_len, head_dim);
+    const float *Ktbh_base = K_PTR(K_transposed, bh_idx, seq_len, head_dim);
     float *attn_bh_base = ATTN_PTR(attn_scores, bh_idx, seq_len);
 
     __shared__ float Q_tile[TILE_DIM][TILE_DIM];
-    __shared__ float Kt_tile[TILE_DIM][TILE_DIM + 1]; // padding
+    __shared__ float Kt_tile[TILE_DIM][TILE_DIM + 1];
 
     float score = 0.0f;
 
@@ -90,15 +125,15 @@ __global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q, const floa
     int num_tiles = (head_dim + TILE_DIM - 1) / TILE_DIM;
     for (int t = 0; t < num_tiles; ++t) {
         int q_col = t * TILE_DIM + local_col;
-        int k_row = t * TILE_DIM + local_row;
+        int kt_row = t * TILE_DIM + local_row;
 
         float q_val = (row < seq_len && q_col < head_dim) ? Qbh_base[row * head_dim + q_col] : 0.0f;
         Q_tile[local_row][local_col] = q_val;
 
         // note transpose
         float kt_val =
-            (col < seq_len && k_row < head_dim) ? Kbh_base[col * head_dim + k_row] : 0.0f;
-        Kt_tile[local_col][local_row] = kt_val;
+            (col < seq_len && kt_row < head_dim) ? Ktbh_base[kt_row * seq_len + col] : 0.0f;
+        Kt_tile[local_row][local_col] = kt_val;
 
         cg_block.sync();
 
@@ -113,10 +148,10 @@ __global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q, const floa
             q_vec.w = Q_tile[local_row][k + 3];
 
             float4 k_vec;
-            k_vec.x = Kt_tile[local_col][k + 0];
-            k_vec.y = Kt_tile[local_col][k + 1];
-            k_vec.z = Kt_tile[local_col][k + 2];
-            k_vec.w = Kt_tile[local_col][k + 3];
+            k_vec.x = Kt_tile[local_row][k + 0];
+            k_vec.y = Kt_tile[local_row][k + 1];
+            k_vec.z = Kt_tile[local_row][k + 2];
+            k_vec.w = Kt_tile[local_row][k + 3];
 
             score = fmaf(q_vec.x, k_vec.x, score);
             score = fmaf(q_vec.y, k_vec.y, score);
@@ -175,7 +210,7 @@ __global__ void softmax_inplace_v2(float *attention_scores,
     for (int s = 0; s < n_strides; s++) {
         int bx = s * blockDim.x + warp_id * warp.size() + lane;
         max_score = (bx < partials_blocks_x) ? row_max_bh_base[bx] : -CUDART_INF_F;
-
+        warp.sync();
         for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
             float other = warp.shfl_xor(max_score, offset);
             max_score = fmaxf(max_score, other);
@@ -192,12 +227,14 @@ __global__ void softmax_inplace_v2(float *attention_scores,
         for (int i = 0; i < num_warps; i += warp.size()) {
             if (lane + i < num_warps)
                 max_score = warp_row_maxes[lane + i];
+            warp.sync();
             for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
                 float other = warp.shfl_xor(max_score, offset);
                 max_score = fmaxf(max_score, other);
             }
             if (lane == 0)
                 warp_row_maxes[0] = fmaxf(max_score, warp_row_maxes[0]);
+            warp.sync();
         }
     }
     cg_block.sync();
@@ -219,7 +256,7 @@ __global__ void softmax_inplace_v2(float *attention_scores,
 
     extern __shared__ float warp_row_sums[];
     __shared__ float row_sum_score[1];
-    if (warp_id == 0 && lane == 0)
+    if (tid == 0)
         row_sum_score[0] = 0.0f;
     cg_block.sync();
 
@@ -321,12 +358,13 @@ struct VanillaAttentionV2 : public Attention {
         cudaDeviceGetAttribute(&warp_size, cudaDevAttrWarpSize, 0);
         assert(TILE_DIM >= warp_size && TILE_DIM % warp_size == 0);
 
-        float *attention_scores;
+        float *attention_scores, *K_transposed;
         float *row_max_partials;
 
         const float scale = 1.0f / sqrtf((float) head_dim);
         const size_t n_qkt = batch_size * num_heads * seq_len * seq_len;
         cudaMalloc(&attention_scores, n_qkt * sizeof(float));
+        cudaMalloc(&K_transposed, n_qkt * sizeof(float));
 
         int blocks_x = (seq_len + TILE_DIM - 1) / TILE_DIM;
         int blocks_y = (seq_len + TILE_DIM - 1) / TILE_DIM;
@@ -334,13 +372,18 @@ struct VanillaAttentionV2 : public Attention {
         const size_t n_partials = batch_size * num_heads * seq_len * blocks_x;
         cudaMalloc(&row_max_partials, n_partials * sizeof(float));
 
-        // Kernel 1: Compute QK^T and partial max values
+        // Kernel 1 & 2: Transpose K + Compute QK^T and partial max values
         dim3 threads(TILE_DIM, TILE_DIM);
         dim3 grid(blocks_x, blocks_y, batch_size * num_heads);
         int warps_per_block = TILE_DIM * (TILE_DIM / warp_size);
         int shared_bytes = warps_per_block * sizeof(float);
+
+        transpose_K<<<grid, threads>>>(K, K_transposed, seq_len, head_dim);
+        cudaDeviceSynchronize();
+        CUDA_CHECK();
+
         qk_dot_partial_reduce_v2<<<grid, threads, shared_bytes>>>(
-            Q, K, attention_scores, row_max_partials, seq_len, head_dim, scale);
+            Q, K_transposed, attention_scores, row_max_partials, seq_len, head_dim, scale);
         cudaDeviceSynchronize();
         CUDA_CHECK();
 
@@ -365,6 +408,7 @@ struct VanillaAttentionV2 : public Attention {
         cudaDeviceSynchronize();
         CUDA_CHECK();
 
+        cudaFree(K_transposed);
         cudaFree(attention_scores);
         cudaFree(row_max_partials);
         CUDA_CHECK();
