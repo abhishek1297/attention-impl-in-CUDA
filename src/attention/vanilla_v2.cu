@@ -113,11 +113,11 @@ __global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q,
     int col = block_col + local_col;
 
     const float *Qbh_base = Q_PTR(Q, bh_idx, seq_len, head_dim);
-    const float *Ktbh_base = K_PTR(K_transposed, bh_idx, seq_len, head_dim);
+    const float *Ktbh_base = K_PTR(K_transposed, bh_idx, head_dim, seq_len);
     float *attn_bh_base = ATTN_PTR(attn_scores, bh_idx, seq_len);
 
     __shared__ float Q_tile[TILE_DIM][TILE_DIM];
-    __shared__ float Kt_tile[TILE_DIM][TILE_DIM + 1];
+    __shared__ float Kt_tile[TILE_DIM][TILE_DIM];
 
     float score = 0.0f;
 
@@ -198,17 +198,21 @@ __global__ void softmax_inplace_v2(float *attention_scores,
     const float *row_max_bh_base =
         PARTIALS_PTR(row_max_partials, bh_idx, row, seq_len, partials_blocks_x);
 
+    // use single shared memory array for both max and sum
+    extern __shared__ float smem[];
+    float *warp_row_maxes = smem;
+    float *warp_row_sums = smem;
+
     // find max (for numerical stability)
     float max_score;
-    extern __shared__ float warp_row_maxes[];
-    if (lane == 0) {
+    if (lane == 0)
         warp_row_maxes[warp_id] = -CUDART_INF_F;
-    }
     cg_block.sync();
 
     int n_strides = (partials_blocks_x + blockDim.x - 1) / blockDim.x;
     for (int s = 0; s < n_strides; s++) {
         int bx = s * blockDim.x + warp_id * warp.size() + lane;
+        // printf("[row=%d, tid=%d, warp_id=%d, lane=%d, bx=%d/%d]\n", row, tid, warp_id, lane, bx, partials_blocks_x);
         max_score = (bx < partials_blocks_x) ? row_max_bh_base[bx] : -CUDART_INF_F;
         warp.sync();
         for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
@@ -225,8 +229,7 @@ __global__ void softmax_inplace_v2(float *attention_scores,
     // this code assumes you can launch at most 32x32 warps over a block
     if (warp_id == 0) {
         for (int i = 0; i < num_warps; i += warp.size()) {
-            if (lane + i < num_warps)
-                max_score = warp_row_maxes[lane + i];
+            max_score = (lane + i < num_warps) ? warp_row_maxes[lane + i] : -CUDART_INF_F;
             warp.sync();
             for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
                 float other = warp.shfl_xor(max_score, offset);
@@ -254,12 +257,6 @@ __global__ void softmax_inplace_v2(float *attention_scores,
     // at this point each thread of the single block will have the strided sum
     cg_block.sync();
 
-    extern __shared__ float warp_row_sums[];
-    __shared__ float row_sum_score[1];
-    if (tid == 0)
-        row_sum_score[0] = 0.0f;
-    cg_block.sync();
-
     // only single reduction workload left at this point
     // per-warp sum scores i.e thread 0 will hold the final sum
     for (int offset = warp.size() / 2; offset > 0; offset >>= 1)
@@ -272,19 +269,23 @@ __global__ void softmax_inplace_v2(float *attention_scores,
     // one more reduction across smem collected sums
     // this code assumes you can launch at most 32x32 warps over a block
     if (warp_id == 0) {
+        // reuse warp_row_sums for final sum
+        float row_sum = 0.0f;
         for (int i = 0; i < num_warps; i += warp.size()) {
             strided_sum_score = (lane + i < num_warps) ? warp_row_sums[lane + i] : 0.0f;
             for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
                 strided_sum_score += warp.shfl_down(strided_sum_score, offset);
             }
             if (lane == 0)
-                row_sum_score[0] += strided_sum_score;
+                row_sum += strided_sum_score;
         }
+        if (lane == 0)
+            warp_row_sums[0] = row_sum; // store final row sum
     }
     cg_block.sync();
 
     // normalize attention scores
-    const float norm = 1 / row_sum_score[0];
+    const float norm = 1.0f / warp_row_sums[0];
     for (int col = tid; col < seq_len; col += blockDim.x) {
         attn_bh_base[row * seq_len + col] *= norm;
     }
@@ -351,6 +352,77 @@ __global__ void softmax_multV_v2(const float *__restrict__ attention_scores,
 // Simple attention implementation
 struct VanillaAttentionV2 : public Attention {
 
+    // Kernel launch: transpose K
+    void launch_transpose_K(const float *K, float *K_transposed, int batch_heads, int seq_len,
+                            int head_dim) {
+        dim3 threads(TILE_DIM, TILE_DIM);
+        int blocks_x = (head_dim + TILE_DIM - 1) / TILE_DIM;
+        int blocks_y = (seq_len + TILE_DIM - 1) / TILE_DIM;
+        dim3 grid(blocks_x, blocks_y, batch_heads);
+
+        transpose_K<<<grid, threads>>>(K, K_transposed, seq_len, head_dim);
+        cudaDeviceSynchronize();
+        CUDA_CHECK();
+    }
+
+    // Kernel launch: compute QK^T with partial max
+    void launch_qk_dot_partial_reduce(const float *Q, const float *K_transposed,
+                                      float *attention_scores, float *row_max_partials,
+                                      int batch_heads, int seq_len, int head_dim, float scale) {
+        int warp_size;
+        cudaDeviceGetAttribute(&warp_size, cudaDevAttrWarpSize, 0);
+
+        dim3 threads(TILE_DIM, TILE_DIM);
+        int blocks = (seq_len + TILE_DIM - 1) / TILE_DIM;
+        dim3 grid(blocks, blocks, batch_heads);
+
+        const size_t n_partials = batch_heads * seq_len * blocks;
+        cudaMalloc(&row_max_partials, n_partials * sizeof(float));
+
+        int warps_per_block = TILE_DIM * (TILE_DIM / warp_size);
+        size_t shared_bytes = warps_per_block * sizeof(float);
+
+        qk_dot_partial_reduce_v2<<<grid, threads, shared_bytes>>>(
+            Q, K_transposed, attention_scores, row_max_partials, seq_len, head_dim, scale);
+        cudaDeviceSynchronize();
+        CUDA_CHECK();
+    }
+
+    // Kernel launch: softmax in-place
+    void launch_softmax_inplace(float *attention_scores, float *row_max_partials, int batch_heads,
+                                int seq_len, int blocks_x) {
+        int warp_size;
+        cudaDeviceGetAttribute(&warp_size, cudaDevAttrWarpSize, 0);
+
+        int device_max_threads;
+        cudaDeviceGetAttribute(&device_max_threads, cudaDevAttrMaxThreadsPerBlock, 0);
+        int per_row_block_threads = std::min(TILE_DIM * blocks_x, device_max_threads);
+        per_row_block_threads = std::max(warp_size, per_row_block_threads);
+
+        int warps_per_block = per_row_block_threads / warp_size;
+        size_t shared_bytes = warps_per_block * sizeof(float);
+
+        dim3 threads(per_row_block_threads, 1, 1);
+        dim3 grid(1, seq_len, batch_heads);
+
+        softmax_inplace_v2<<<grid, threads, shared_bytes>>>(attention_scores, row_max_partials,
+                                                            seq_len, blocks_x);
+        cudaDeviceSynchronize();
+        CUDA_CHECK();
+    }
+
+    // Kernel launch: softmax multiply by V
+    void launch_softmax_multV(float *attention_scores, const float *V, float *O, int batch_heads,
+                              int seq_len, int head_dim) {
+        dim3 threads(TILE_DIM, TILE_DIM);
+        int blocks = (seq_len + TILE_DIM - 1) / TILE_DIM;
+        dim3 grid(blocks, blocks, batch_heads);
+
+        softmax_multV_v2<<<grid, threads>>>(attention_scores, V, O, seq_len, head_dim);
+        cudaDeviceSynchronize();
+        CUDA_CHECK();
+    }
+
     void forward(const float *Q, const float *K, const float *V, float *O, uint32_t batch_size,
                  uint32_t num_heads, uint32_t seq_len, uint32_t head_dim) override {
 
@@ -358,55 +430,23 @@ struct VanillaAttentionV2 : public Attention {
         cudaDeviceGetAttribute(&warp_size, cudaDevAttrWarpSize, 0);
         assert(TILE_DIM >= warp_size && TILE_DIM % warp_size == 0);
 
-        float *attention_scores, *K_transposed;
-        float *row_max_partials;
+        float *attention_scores = nullptr;
+        float *K_transposed = nullptr;
+        float *row_max_partials = nullptr;
 
+        const int batch_heads = batch_size * num_heads;
         const float scale = 1.0f / sqrtf((float) head_dim);
-        const size_t n_qkt = batch_size * num_heads * seq_len * seq_len;
+        const size_t n_qkt = batch_heads * seq_len * seq_len;
+
         cudaMalloc(&attention_scores, n_qkt * sizeof(float));
-        cudaMalloc(&K_transposed, n_qkt * sizeof(float));
+        cudaMalloc(&K_transposed, batch_heads * head_dim * seq_len * sizeof(float));
 
-        int blocks_x = (seq_len + TILE_DIM - 1) / TILE_DIM;
-        int blocks_y = (seq_len + TILE_DIM - 1) / TILE_DIM;
-
-        const size_t n_partials = batch_size * num_heads * seq_len * blocks_x;
-        cudaMalloc(&row_max_partials, n_partials * sizeof(float));
-
-        // Kernel 1 & 2: Transpose K + Compute QK^T and partial max values
-        dim3 threads(TILE_DIM, TILE_DIM);
-        dim3 grid(blocks_x, blocks_y, batch_size * num_heads);
-        int warps_per_block = TILE_DIM * (TILE_DIM / warp_size);
-        int shared_bytes = warps_per_block * sizeof(float);
-
-        transpose_K<<<grid, threads>>>(K, K_transposed, seq_len, head_dim);
-        cudaDeviceSynchronize();
-        CUDA_CHECK();
-
-        qk_dot_partial_reduce_v2<<<grid, threads, shared_bytes>>>(
-            Q, K_transposed, attention_scores, row_max_partials, seq_len, head_dim, scale);
-        cudaDeviceSynchronize();
-        CUDA_CHECK();
-
-        // save_device_ptr_as_buffer("QKt.bin", attention_scores, n_qkt);
-
-        // Kernel 2:  Apply per row max and normalize with per row sum
-        int device_max_threads;
-        cudaDeviceGetAttribute(&device_max_threads, cudaDevAttrMaxThreadsPerBlock, 0);
-        int per_row_block_threads = std::min(TILE_DIM * blocks_x, device_max_threads);
-        per_row_block_threads = std::max(warp_size, per_row_block_threads);
-        warps_per_block = per_row_block_threads / warp_size;
-        dim3 threads2(per_row_block_threads, 1, 1);
-        dim3 grid2(1, seq_len, batch_size * num_heads);
-        shared_bytes = 2 * warps_per_block * sizeof(float);
-        softmax_inplace_v2<<<grid2, threads2>>>(attention_scores, row_max_partials, seq_len,
-                                                blocks_x);
-        cudaDeviceSynchronize();
-        CUDA_CHECK();
-
-        // Kernel 3: Apply softmax and multiply by V
-        softmax_multV_v2<<<grid, threads>>>(attention_scores, V, O, seq_len, head_dim);
-        cudaDeviceSynchronize();
-        CUDA_CHECK();
+        // launch_transpose_K(K, K_transposed, batch_heads, seq_len, head_dim);
+        // launch_qk_dot_partial_reduce(Q, K_transposed, attention_scores, row_max_partials,
+        //                              batch_heads, seq_len, head_dim, scale);
+        launch_softmax_inplace(attention_scores, row_max_partials, batch_heads, seq_len,
+                               (seq_len + TILE_DIM - 1) / TILE_DIM);
+        // launch_softmax_multV(attention_scores, V, O, batch_heads, seq_len, head_dim);
 
         cudaFree(K_transposed);
         cudaFree(attention_scores);
