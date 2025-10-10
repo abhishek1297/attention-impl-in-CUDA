@@ -34,6 +34,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--o_bin", type=str, required=True, help="Path to O.bin (kernel output)"
     )
+    parser.add_argument(
+        "--qkt_bin", type=str, required=False, default="", help="Path to QKt.bin"
+    )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--tolerance", type=float, default=1e-4)
     args = parser.parse_args()
@@ -53,9 +56,17 @@ if __name__ == "__main__":
     Kbh = load_and_assert(args.k_bin, (batch_heads, seq_len, head_dim))
     Vbh = load_and_assert(args.v_bin, (batch_heads, seq_len, head_dim))
     kernel_out = load_and_assert(args.o_bin, (batch_heads, seq_len, head_dim))
+    if args.qkt_bin:
+        QKtbh = load_and_assert(args.qkt_bin, (batch_heads, seq_len, seq_len))
 
     scale = 1 / head_dim**0.5
     Sbh = torch.bmm(Qbh, Kbh.transpose(1, 2)) * scale
+    if args.qkt_bin:
+        diff = (QKtbh - Sbh).abs()
+        max_err = diff.max().item()
+        mean_err = diff.mean().item()
+        print(f"[QKt]\tMax abs diff = {max_err:.6e}, mean abs diff = {mean_err:.6e}")
+
     probs = F.softmax(Sbh, dim=2)
     outputs = torch.bmm(probs, Vbh)
 
@@ -63,7 +74,7 @@ if __name__ == "__main__":
     diff = (kernel_out - outputs).abs()
     max_err = diff.max().item()
     mean_err = diff.mean().item()
-    print(f"\n\nMax abs diff = {max_err:.6e}, mean abs diff = {mean_err:.6e}")
+    print(f"[FINAL]\tMax abs diff = {max_err:.6e}, mean abs diff = {mean_err:.6e}")
 
     if max_err <= args.tolerance:
         print("\nPASS: kernel output matches PyTorch reference within tolerance.")
