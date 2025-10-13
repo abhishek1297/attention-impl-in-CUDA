@@ -116,8 +116,8 @@ __global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q,
     const float *Ktbh_base = K_PTR(K_transposed, bh_idx, head_dim, seq_len);
     float *attn_bh_base = ATTN_PTR(attn_scores, bh_idx, seq_len);
 
-    __shared__ float Q_tile[TILE_DIM][TILE_DIM];
-    __shared__ float Kt_tile[TILE_DIM][TILE_DIM];
+    __shared__ float Q_tile[TILE_DIM][TILE_DIM + 1];
+    __shared__ float Kt_tile[TILE_DIM][TILE_DIM + 1];
 
     float score = 0.0f;
 
@@ -148,10 +148,10 @@ __global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q,
             q_vec.w = Q_tile[local_row][k + 3];
 
             float4 k_vec;
-            k_vec.x = Kt_tile[local_row][k + 0];
-            k_vec.y = Kt_tile[local_row][k + 1];
-            k_vec.z = Kt_tile[local_row][k + 2];
-            k_vec.w = Kt_tile[local_row][k + 3];
+            k_vec.x = Kt_tile[k + 0][local_col];
+            k_vec.y = Kt_tile[k + 1][local_col];
+            k_vec.z = Kt_tile[k + 2][local_col];
+            k_vec.w = Kt_tile[k + 3][local_col];
 
             score = fmaf(q_vec.x, k_vec.x, score);
             score = fmaf(q_vec.y, k_vec.y, score);
