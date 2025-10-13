@@ -212,7 +212,6 @@ __global__ void softmax_inplace_v2(float *attention_scores,
     int n_strides = (partials_blocks_x + blockDim.x - 1) / blockDim.x;
     for (int s = 0; s < n_strides; s++) {
         int bx = s * blockDim.x + warp_id * warp.size() + lane;
-        // printf("[row=%d, tid=%d, warp_id=%d, lane=%d, bx=%d/%d]\n", row, tid, warp_id, lane, bx, partials_blocks_x);
         max_score = (bx < partials_blocks_x) ? row_max_bh_base[bx] : -CUDART_INF_F;
         warp.sync();
         for (int offset = warp.size() / 2; offset > 0; offset >>= 1) {
@@ -354,10 +353,10 @@ struct VanillaAttentionV2 : public Attention {
 
     // Kernel launch: transpose K
     void launch_transpose_K(const float *K, float *K_transposed, int batch_heads, int seq_len,
-                            int head_dim) {
+                            int head_dim, int blocks) {
         dim3 threads(TILE_DIM, TILE_DIM);
         int blocks_x = (head_dim + TILE_DIM - 1) / TILE_DIM;
-        int blocks_y = (seq_len + TILE_DIM - 1) / TILE_DIM;
+        int blocks_y = blocks;
         dim3 grid(blocks_x, blocks_y, batch_heads);
 
         transpose_K<<<grid, threads>>>(K, K_transposed, seq_len, head_dim);
@@ -368,16 +367,13 @@ struct VanillaAttentionV2 : public Attention {
     // Kernel launch: compute QK^T with partial max
     void launch_qk_dot_partial_reduce(const float *Q, const float *K_transposed,
                                       float *attention_scores, float *row_max_partials,
-                                      int batch_heads, int seq_len, int head_dim, float scale) {
+                                      int batch_heads, int seq_len, int head_dim, float scale,
+                                      int blocks) {
         int warp_size;
         cudaDeviceGetAttribute(&warp_size, cudaDevAttrWarpSize, 0);
 
         dim3 threads(TILE_DIM, TILE_DIM);
-        int blocks = (seq_len + TILE_DIM - 1) / TILE_DIM;
         dim3 grid(blocks, blocks, batch_heads);
-
-        const size_t n_partials = batch_heads * seq_len * blocks;
-        cudaMalloc(&row_max_partials, n_partials * sizeof(float));
 
         int warps_per_block = TILE_DIM * (TILE_DIM / warp_size);
         size_t shared_bytes = warps_per_block * sizeof(float);
@@ -389,8 +385,9 @@ struct VanillaAttentionV2 : public Attention {
     }
 
     // Kernel launch: softmax in-place
-    void launch_softmax_inplace(float *attention_scores, float *row_max_partials, int batch_heads,
-                                int seq_len, int blocks_x) {
+    void launch_softmax_inplace(float *attention_scores, const float *row_max_partials,
+                                int batch_heads, int seq_len, int blocks_x) {
+
         int warp_size;
         cudaDeviceGetAttribute(&warp_size, cudaDevAttrWarpSize, 0);
 
@@ -413,9 +410,8 @@ struct VanillaAttentionV2 : public Attention {
 
     // Kernel launch: softmax multiply by V
     void launch_softmax_multV(float *attention_scores, const float *V, float *O, int batch_heads,
-                              int seq_len, int head_dim) {
+                              int seq_len, int head_dim, int blocks) {
         dim3 threads(TILE_DIM, TILE_DIM);
-        int blocks = (seq_len + TILE_DIM - 1) / TILE_DIM;
         dim3 grid(blocks, blocks, batch_heads);
 
         softmax_multV_v2<<<grid, threads>>>(attention_scores, V, O, seq_len, head_dim);
@@ -437,16 +433,21 @@ struct VanillaAttentionV2 : public Attention {
         const int batch_heads = batch_size * num_heads;
         const float scale = 1.0f / sqrtf((float) head_dim);
         const size_t n_qkt = batch_heads * seq_len * seq_len;
+        const size_t blocks = (seq_len + TILE_DIM - 1) / TILE_DIM; // blocks in 1 direction
+        const size_t partials_blocks_x = blocks;
+        const size_t n_partials = batch_heads * seq_len * partials_blocks_x;
 
         cudaMalloc(&attention_scores, n_qkt * sizeof(float));
         cudaMalloc(&K_transposed, batch_heads * head_dim * seq_len * sizeof(float));
+        cudaMalloc(&row_max_partials, n_partials * sizeof(float));
 
-        // launch_transpose_K(K, K_transposed, batch_heads, seq_len, head_dim);
-        // launch_qk_dot_partial_reduce(Q, K_transposed, attention_scores, row_max_partials,
-        //                              batch_heads, seq_len, head_dim, scale);
+        launch_transpose_K(K, K_transposed, batch_heads, seq_len, head_dim, blocks);
+        launch_qk_dot_partial_reduce(Q, K_transposed, attention_scores, row_max_partials,
+                                     batch_heads, seq_len, head_dim, scale, blocks);
+        // save_device_ptr_as_buffer("QKt.bin", attention_scores, n_qkt);
         launch_softmax_inplace(attention_scores, row_max_partials, batch_heads, seq_len,
-                               (seq_len + TILE_DIM - 1) / TILE_DIM);
-        // launch_softmax_multV(attention_scores, V, O, batch_heads, seq_len, head_dim);
+                               partials_blocks_x);
+        launch_softmax_multV(attention_scores, V, O, batch_heads, seq_len, head_dim, blocks);
 
         cudaFree(K_transposed);
         cudaFree(attention_scores);
