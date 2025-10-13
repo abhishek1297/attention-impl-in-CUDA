@@ -293,6 +293,8 @@ __global__ void softmax_inplace_v2(float *attention_scores,
 // Kernel: apply softmax and multiply by V
 __global__ void softmax_multV_v2(const float *__restrict__ attention_scores,
                                  const float *__restrict__ V, float *O, int seq_len, int head_dim) {
+    // cooperative-groups block object
+    cg::thread_block cg_block = cg::this_thread_block();
 
     int bh_idx = blockIdx.z;
     int block_row = blockIdx.y * TILE_DIM;
@@ -311,8 +313,8 @@ __global__ void softmax_multV_v2(const float *__restrict__ attention_scores,
     const float *Vbh_base = V_PTR(V, bh_idx, seq_len, head_dim);
     float *Obh_base = O_PTR(O, bh_idx, seq_len, head_dim);
 
-    __shared__ float softmax_tile[TILE_DIM][TILE_DIM];
-    __shared__ float V_tile[TILE_DIM][TILE_DIM];
+    __shared__ float softmax_tile[TILE_DIM][TILE_DIM + 1];
+    __shared__ float V_tile[TILE_DIM][TILE_DIM + 1];
 
     float acc = 0.0f;
 
@@ -321,7 +323,6 @@ __global__ void softmax_multV_v2(const float *__restrict__ attention_scores,
     for (int t = 0; t < num_tiles; ++t) {
         int k = t * TILE_DIM + local_col;
 
-        // Load softmax tile: softmax[row, k]
         if (row < seq_len && k < seq_len) {
             softmax_tile[local_row][local_col] = attn_bh_base[row * seq_len + k];
         } else {
@@ -334,13 +335,28 @@ __global__ void softmax_multV_v2(const float *__restrict__ attention_scores,
         } else {
             V_tile[local_row][local_col] = 0.0f;
         }
-        __syncthreads();
+        cg_block.sync();
 
 #pragma unroll
-        for (int k = 0; k < TILE_DIM; ++k) {
-            acc += softmax_tile[local_row][k] * V_tile[k][local_col];
+        for (int k = 0; k < TILE_DIM; k += 4) {
+            float4 s_vec;
+            s_vec.x = softmax_tile[local_row][k + 0];
+            s_vec.y = softmax_tile[local_row][k + 1];
+            s_vec.z = softmax_tile[local_row][k + 2];
+            s_vec.w = softmax_tile[local_row][k + 3];
+
+            float4 v_vec;
+            v_vec.x = V_tile[k + 0][local_col];
+            v_vec.y = V_tile[k + 1][local_col];
+            v_vec.z = V_tile[k + 2][local_col];
+            v_vec.w = V_tile[k + 3][local_col];
+
+            acc = fmaf(s_vec.x, v_vec.x, acc);
+            acc = fmaf(s_vec.y, v_vec.y, acc);
+            acc = fmaf(s_vec.z, v_vec.z, acc);
+            acc = fmaf(s_vec.w, v_vec.w, acc);
         }
-        __syncthreads();
+        cg_block.sync();
     }
 
     if (row < seq_len && col < head_dim) {
