@@ -116,7 +116,7 @@ __global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q,
     const float *Ktbh_base = K_PTR(K_transposed, bh_idx, head_dim, seq_len);
     float *attn_bh_base = ATTN_PTR(attn_scores, bh_idx, seq_len);
 
-    __shared__ float Q_tile[TILE_DIM][TILE_DIM + 1];
+    __shared__ alignas(float4) float Q_tile[TILE_DIM][TILE_DIM];
     __shared__ float Kt_tile[TILE_DIM][TILE_DIM + 1];
 
     float score = 0.0f;
@@ -138,14 +138,17 @@ __global__ void qk_dot_partial_reduce_v2(const float *__restrict__ Q,
         cg_block.sync();
 
         // inner product for this tile vectorized in groups of 4
+        const float4 *q_vec_row = reinterpret_cast<const float4 *>(&Q_tile[local_row][0]);
 #pragma unroll
         for (int k = 0; k < TILE_DIM; k += 4) {
 
-            float4 q_vec;
-            q_vec.x = Q_tile[local_row][k + 0];
-            q_vec.y = Q_tile[local_row][k + 1];
-            q_vec.z = Q_tile[local_row][k + 2];
-            q_vec.w = Q_tile[local_row][k + 3];
+            float4 q_vec = q_vec_row[k / 4];
+
+            // float4 q_vec;
+            // q_vec.x = Q_tile[local_row][k + 0];
+            // q_vec.y = Q_tile[local_row][k + 1];
+            // q_vec.z = Q_tile[local_row][k + 2];
+            // q_vec.w = Q_tile[local_row][k + 3];
 
             float4 k_vec;
             k_vec.x = Kt_tile[k + 0][local_col];
@@ -313,7 +316,7 @@ __global__ void softmax_multV_v2(const float *__restrict__ attention_scores,
     const float *Vbh_base = V_PTR(V, bh_idx, seq_len, head_dim);
     float *Obh_base = O_PTR(O, bh_idx, seq_len, head_dim);
 
-    __shared__ float softmax_tile[TILE_DIM][TILE_DIM + 1];
+    __shared__ alignas(float4) float softmax_tile[TILE_DIM][TILE_DIM];
     __shared__ float V_tile[TILE_DIM][TILE_DIM + 1];
 
     float acc = 0.0f;
@@ -337,13 +340,11 @@ __global__ void softmax_multV_v2(const float *__restrict__ attention_scores,
         }
         cg_block.sync();
 
+        // inner product for this tile vectorized in groups of 4
+        const float4 *s_vec_row = reinterpret_cast<const float4 *>(&softmax_tile[local_row][0]);
 #pragma unroll
         for (int k = 0; k < TILE_DIM; k += 4) {
-            float4 s_vec;
-            s_vec.x = softmax_tile[local_row][k + 0];
-            s_vec.y = softmax_tile[local_row][k + 1];
-            s_vec.z = softmax_tile[local_row][k + 2];
-            s_vec.w = softmax_tile[local_row][k + 3];
+            float4 s_vec = s_vec_row[k / 4];
 
             float4 v_vec;
             v_vec.x = V_tile[k + 0][local_col];
