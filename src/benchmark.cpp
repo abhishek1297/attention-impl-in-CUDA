@@ -8,7 +8,7 @@ Benchmark::Benchmark(const std::string &filename, std::function<Attention *()> f
     cudaEventCreate(&start_event);
     cudaEventCreate(&stop_event);
     csv_file.open(filename);
-    csv_file << "batch_size,num_heads,seq_len,head_dim,avg_time_ms,gflops\n";
+    csv_file << "batch_size,num_heads,seq_len,head_dim,avg_time_ms,tflops\n";
 }
 
 Benchmark::~Benchmark() {
@@ -38,14 +38,24 @@ float Benchmark::get_avg_elapsed_time() const {
     return std::accumulate(times.begin(), times.end(), 0.0f) / times.size();
 }
 
-double Benchmark::get_gflops(uint32_t batch_size, uint32_t num_heads, uint32_t seq_len,
+double Benchmark::get_tflops(uint32_t batch_size, uint32_t num_heads, uint32_t seq_len,
                              uint32_t head_dim, float avg_time_ms) const {
-    double flops = batch_size * num_heads *
-                   (2.0 * seq_len * seq_len * head_dim + // QK^T
-                    seq_len * seq_len +                  // softmax
-                    2.0 * seq_len * seq_len * head_dim   // softmax*V
-                   );
-    return (flops / (avg_time_ms / 1000.0)) / 1e9;
+    double batch_heads = static_cast<double>(batch_size) * num_heads;
+
+    // QK^T
+    double qkt_flops = batch_heads * seq_len * seq_len * (2.0 * head_dim - 1.0);
+
+    // Softmax (approx. 4 * seq_len^2 per head)
+    double softmax_flops = batch_heads * 4.0 * seq_len * seq_len;
+
+    // Softmax * V
+    double sv_flops = batch_heads * seq_len * head_dim * (2.0 * seq_len - 1.0);
+
+    double total_flops = qkt_flops + softmax_flops + sv_flops;
+
+    double seconds = avg_time_ms * 1e-3;
+    double tflops = total_flops / (seconds * 1e12);
+    return tflops;
 }
 
 void Benchmark::run(const uint32_t total_runs, const float *Q, const float *K, const float *V,
@@ -64,8 +74,9 @@ void Benchmark::run(const uint32_t total_runs, const float *Q, const float *K, c
     }
 
     float avg_time_ms = get_avg_elapsed_time();
-    double gflops = get_gflops(batch_size, num_heads, seq_len, head_dim, avg_time_ms);
+    double tflops = get_tflops(batch_size, num_heads, seq_len, head_dim, avg_time_ms);
 
     csv_file << batch_size << "," << num_heads << "," << seq_len << "," << head_dim << ","
-             << avg_time_ms << "," << gflops << "\n";
+             << avg_time_ms << "," << tflops << "\n";
+    times.clear();
 }

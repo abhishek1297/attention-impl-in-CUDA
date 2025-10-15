@@ -377,8 +377,8 @@ struct VanillaAttentionV2 : public Attention {
         dim3 grid(blocks_x, blocks_y, batch_heads);
 
         transpose_K<<<grid, threads>>>(K, K_transposed, seq_len, head_dim);
-        cudaDeviceSynchronize();
-        CUDA_CHECK();
+        // cudaDeviceSynchronize();
+        // CUDA_CHECK();
     }
 
     // Kernel launch: compute QK^T with partial max
@@ -397,8 +397,9 @@ struct VanillaAttentionV2 : public Attention {
 
         qk_dot_partial_reduce_v2<<<grid, threads, shared_bytes>>>(
             Q, K_transposed, attention_scores, row_max_partials, seq_len, head_dim, scale);
-        cudaDeviceSynchronize();
-        CUDA_CHECK();
+        // cudaDeviceSynchronize();
+        // CUDA_CHECK();
+        // save_device_ptr_as_buffer("QKt.bin", attention_scores, n_qkt);
     }
 
     // Kernel launch: softmax in-place
@@ -421,8 +422,8 @@ struct VanillaAttentionV2 : public Attention {
 
         softmax_inplace_v2<<<grid, threads, shared_bytes>>>(attention_scores, row_max_partials,
                                                             seq_len, blocks_x);
-        cudaDeviceSynchronize();
-        CUDA_CHECK();
+        // cudaDeviceSynchronize();
+        // CUDA_CHECK();
     }
 
     // Kernel launch: softmax multiply by V
@@ -432,8 +433,8 @@ struct VanillaAttentionV2 : public Attention {
         dim3 grid(blocks, blocks, batch_heads);
 
         softmax_multV_v2<<<grid, threads>>>(attention_scores, V, O, seq_len, head_dim);
-        cudaDeviceSynchronize();
-        CUDA_CHECK();
+        // cudaDeviceSynchronize();
+        // CUDA_CHECK();
     }
 
     void forward(const float *Q, const float *K, const float *V, float *O, uint32_t batch_size,
@@ -461,11 +462,11 @@ struct VanillaAttentionV2 : public Attention {
         launch_transpose_K(K, K_transposed, batch_heads, seq_len, head_dim, blocks);
         launch_qk_dot_partial_reduce(Q, K_transposed, attention_scores, row_max_partials,
                                      batch_heads, seq_len, head_dim, scale, blocks);
-        // save_device_ptr_as_buffer("QKt.bin", attention_scores, n_qkt);
         launch_softmax_inplace(attention_scores, row_max_partials, batch_heads, seq_len,
                                partials_blocks_x);
         launch_softmax_multV(attention_scores, V, O, batch_heads, seq_len, head_dim, blocks);
 
+        cudaDeviceSynchronize();
         cudaFree(K_transposed);
         cudaFree(attention_scores);
         cudaFree(row_max_partials);

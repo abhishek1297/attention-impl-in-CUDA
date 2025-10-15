@@ -22,7 +22,7 @@ class Benchmark {
     void stop();
 
     float get_avg_elapsed_time() const;
-    double get_gflops(uint32_t batch_size, uint32_t num_heads, uint32_t seq_len, uint32_t head_dim,
+    double get_tflops(uint32_t batch_size, uint32_t num_heads, uint32_t seq_len, uint32_t head_dim,
                       float avg_time_ms) const;
 
     void run(uint32_t total_runs, const float *Q, const float *K, const float *V, float *O,

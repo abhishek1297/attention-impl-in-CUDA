@@ -76,7 +76,7 @@ struct CublasAttention : public Attention {
         if (status != CUBLAS_STATUS_SUCCESS) {
             throw std::runtime_error("cuBLAS initialization failed");
         }
-        cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
+        cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH);
     }
 
     ~CublasAttention() { cublasDestroy(handle); }
@@ -122,13 +122,13 @@ struct CublasAttention : public Attention {
             throw std::runtime_error("cuBLAS GEMM failed");
         }
 
-        cudaDeviceSynchronize();
+        // cudaDeviceSynchronize();
 
         // Step 2: Apply softmax row-wise
         dim3 threads(256, 1, 1);
         dim3 grid(1, seq_len, batch_heads);
         batched_softmax_inplace<<<grid, threads>>>(attention_scores, seq_len, batch_heads);
-        cudaDeviceSynchronize();
+        // cudaDeviceSynchronize();
 
         // Step 3: Compute attention_scores @ V (strided batched matrix multiplication)
         alpha = 1.0f;

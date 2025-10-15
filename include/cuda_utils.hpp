@@ -50,6 +50,20 @@ inline void save_device_ptr_as_buffer(std::string fname, float *device_ptr, int 
     free(host_ptr);
 }
 
+inline int get_fma_per_cycle_per_sm_fp32(int major, int minor) {
+    int compute_cap = major * 10 + minor;
+    switch (compute_cap) {
+    case 70:
+    case 72: // Volta
+    case 75: // Turing
+    case 80: // Ampere
+        return 64;
+    default:
+        std::cerr << "Unknown compute capability " << major << "." << minor << std::endl;
+        return 64;
+    }
+}
+
 inline void write_gpu_info() {
     int device_id = 0;
     cudaDeviceProp prop;
@@ -57,13 +71,14 @@ inline void write_gpu_info() {
 
     std::string name(prop.name);
     int sm_count = prop.multiProcessorCount;
+    int major_cc = prop.major;
+    int minor_cc = prop.minor;
     double clock_rate_hz = static_cast<double>(prop.clockRate) * 1e3;
 
-    // FP32 throughput estimate: 128 FMA units per SM => 256 FLOPs/clock per SM
-    const int fma_per_cycle_per_sm = 128;
+    const int fma_per_cycle_per_sm = get_fma_per_cycle_per_sm_fp32(major_cc, minor_cc);
     double theoretical_flops =
         static_cast<double>(sm_count) * fma_per_cycle_per_sm * 2.0 * clock_rate_hz;
-    double theoretical_gflops = theoretical_flops / 1e9;
+    double theoretical_tflops = theoretical_flops / 1e12;
 
     // Memory bandwidth (approximate)
     double mem_bandwidth_gb = 2.0 * prop.memoryClockRate * 1000.0 * (prop.memoryBusWidth / 8) / 1e9;
@@ -73,14 +88,12 @@ inline void write_gpu_info() {
     size_t shared_mem_per_block = prop.sharedMemPerBlock;
     int max_threads_per_block = prop.maxThreadsPerBlock;
     int regs_per_block = prop.regsPerBlock;
-    int major_cc = prop.major;
-    int minor_cc = prop.minor;
 
     // Write to CSV
     std::ofstream out("benchmarks/device_info.csv");
-    out << "name,sm_count,clock_rate_hz,theoretical_gflops,memory_bandwidth_gb,"
+    out << "name,sm_count,clock_rate_hz,theoretical_tflops,memory_bandwidth_gb,"
         << "warp_size,shared_mem_per_block,max_threads_per_block,regs_per_block,cc\n";
-    out << "\"" << name << "\"," << sm_count << "," << clock_rate_hz << "," << theoretical_gflops
+    out << "\"" << name << "\"," << sm_count << "," << clock_rate_hz << "," << theoretical_tflops
         << "," << mem_bandwidth_gb << "," << warp_size << "," << shared_mem_per_block << ","
         << max_threads_per_block << "," << regs_per_block << "," << major_cc << "." << minor_cc
         << "\n";
@@ -93,7 +106,7 @@ inline void write_gpu_info() {
     std::cout << "Compute Capability: " << major_cc << "." << minor_cc << "\n";
     std::cout << "SM count: " << sm_count << "\n";
     std::cout << "Clock: " << clock_rate_hz / 1e9 << " GHz\n";
-    std::cout << "Theoretical FP32 peak: " << theoretical_gflops << " GFLOPs\n";
+    std::cout << "Theoretical FP32 peak: " << theoretical_tflops << " TFLOPs\n";
     std::cout << "Memory Bandwidth: " << mem_bandwidth_gb << " GB/s\n";
     std::cout << "Warp Size: " << warp_size << "\n";
     std::cout << "Shared Mem / Block: " << shared_mem_per_block / 1024.0 << " KB\n";
