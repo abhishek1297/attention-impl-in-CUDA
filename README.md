@@ -13,7 +13,7 @@ You can set up the environment using the provided **spack** environment files in
 
 ### Run the executable
 ```bash
-./build/cuda_attention
+./build/run_entrypoint
 ```
 
 # TODO:
@@ -25,7 +25,5 @@ You can set up the environment using the provided **spack** environment files in
   - [ ] Create a test kernel for batched/multi-headed GEMM using MMA tensor cores
   - [ ] Create a **baseline** kernel using cuBLAS/CUTLASS for batched/multi-headed GEMM using tensor cores
 - [ ] Sparse / Local Attention – e.g., Longformer or Neighborhood Attention.
-- [ ] Linformer / Linear Attention – low-rank or kernel tricks to reduce complexity.
-- [ ] Performer – FAVOR+ kernel feature maps for linear-time softmax approximation.
 - [ ] FlashAttention – memory-efficient, blockwise softmax on GPU.
 - [ ] FlashAttention-2 – improved tiling + parallelism for long sequences.
